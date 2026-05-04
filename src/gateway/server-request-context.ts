@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { TrustedProxyAuthEvidence } from "./auth.js";
 import type { GatewayServerLiveState } from "./server-live-state.js";
 import type { GatewayRequestContext, GatewayClient } from "./server-methods/types.js";
 import { disconnectAllSharedGatewayAuthClients } from "./server-shared-auth-generation.js";
@@ -6,6 +7,8 @@ import { disconnectAllSharedGatewayAuthClients } from "./server-shared-auth-gene
 type GatewayRequestContextClient = GatewayClient & {
   socket: { close: (code: number, reason: string) => void };
   usesSharedGatewayAuth?: boolean;
+  trustedProxyUser?: string;
+  trustedProxyAuthEvidence?: TrustedProxyAuthEvidence;
 };
 
 type GatewayRequestContextParams = {
@@ -31,6 +34,7 @@ type GatewayRequestContextParams = {
   hasConnectedMobileNode: GatewayRequestContext["hasConnectedMobileNode"];
   clients: Set<GatewayRequestContextClient>;
   enforceSharedGatewayAuthGenerationForConfigWrite: (nextConfig: OpenClawConfig) => void;
+  applyTrustedProxyAuthChange: (prev: OpenClawConfig, next: OpenClawConfig) => void;
   nodeRegistry: GatewayRequestContext["nodeRegistry"];
   agentRunSeq: GatewayRequestContext["agentRunSeq"];
   chatAbortControllers: GatewayRequestContext["chatAbortControllers"];
@@ -127,6 +131,7 @@ export function createGatewayRequestContext(
     },
     enforceSharedGatewayAuthGenerationForConfigWrite:
       params.enforceSharedGatewayAuthGenerationForConfigWrite,
+    applyTrustedProxyAuthChange: params.applyTrustedProxyAuthChange,
     nodeRegistry: params.nodeRegistry,
     agentRunSeq: params.agentRunSeq,
     chatAbortControllers: params.chatAbortControllers,

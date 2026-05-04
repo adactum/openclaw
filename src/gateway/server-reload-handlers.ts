@@ -135,6 +135,7 @@ type ManagedGatewayConfigReloaderParams = Omit<
   resolveSharedGatewaySessionGenerationForConfig: (config: OpenClawConfig) => string | undefined;
   sharedGatewaySessionGenerationState: SharedGatewaySessionGenerationState;
   clients: Iterable<SharedGatewayAuthClient>;
+  applyTrustedProxyAuthChange?: (prev: OpenClawConfig, next: OpenClawConfig) => void;
 };
 
 export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) {
@@ -496,6 +497,15 @@ export function startManagedGatewayConfigReloader(params: ManagedGatewayConfigRe
       }),
   });
 
+  let previousConfig = params.initialConfig;
+  // Reloader trigger: delegates to the instance-owned applicator passed in
+  // from server.impl. The applicator dedups against the in-process
+  // config-write trigger via a per-instance fingerprint, so a transition
+  // observed by both triggers bumps and dispatches exactly once.
+  const applyTrustedProxyConfigChange = (prev: OpenClawConfig, next: OpenClawConfig): void => {
+    params.applyTrustedProxyAuthChange?.(prev, next);
+  };
+
   return startGatewayConfigReloader({
     initialConfig: params.initialConfig,
     initialCompareConfig: params.initialCompareConfig,
@@ -543,6 +553,8 @@ export function startManagedGatewayConfigReloader(params: ManagedGatewayConfigRe
         params.sharedGatewaySessionGenerationState,
         nextSharedGatewaySessionGeneration,
       );
+      applyTrustedProxyConfigChange(previousConfig, nextConfig);
+      previousConfig = nextConfig;
     },
     onRestart: async (plan, nextConfig) => {
       const previousRequiredSharedGatewaySessionGeneration =
@@ -572,6 +584,8 @@ export function startManagedGatewayConfigReloader(params: ManagedGatewayConfigRe
           } else {
             params.sharedGatewaySessionGenerationState.required = null;
           }
+          applyTrustedProxyConfigChange(previousConfig, nextConfig);
+          previousConfig = nextConfig;
           return;
         }
         if (previousSharedGatewaySessionGeneration !== nextSharedGatewaySessionGeneration) {
@@ -583,6 +597,8 @@ export function startManagedGatewayConfigReloader(params: ManagedGatewayConfigRe
         } else {
           params.sharedGatewaySessionGenerationState.required = null;
         }
+        applyTrustedProxyConfigChange(previousConfig, nextConfig);
+        previousConfig = nextConfig;
       } catch (error) {
         params.sharedGatewaySessionGenerationState.required =
           previousRequiredSharedGatewaySessionGeneration;

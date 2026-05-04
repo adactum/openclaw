@@ -1069,7 +1069,7 @@ describe("trusted-proxy auth", () => {
         } as never,
       });
 
-      expect(res).toEqual({
+      expect(res).toMatchObject({
         ok: true,
         method: "trusted-proxy",
         user: "nick@example.com",

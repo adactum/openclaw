@@ -18,7 +18,6 @@ import {
   approveDevicePairing,
   ensureDeviceToken,
   getPairedDevice,
-  hasEffectivePairedDeviceRole,
   listApprovedPairedDeviceRoles,
   listDevicePairing,
   listEffectivePairedDeviceRoles,
@@ -125,9 +124,14 @@ import {
   evaluateMissingDeviceIdentity,
   isTrustedProxyControlUiOperatorAuth,
   resolveControlUiAuthPolicy,
-  shouldClearUnboundScopesForMissingDeviceIdentity,
+  shouldClampUnboundScopes,
   shouldSkipControlUiPairing,
+  validateConnectScopeVocabulary,
 } from "./connect-policy.js";
+import {
+  createScopeBaselineTracker,
+  pairingStateAllowsRequestedAccess,
+} from "./connect-scope-baseline.js";
 import {
   resolveDeviceSignaturePayloadVersion,
   resolveHandshakeBrowserSecurityContext,
@@ -136,6 +140,7 @@ import {
   shouldAllowSilentLocalPairing,
   shouldSkipLocalBackendSelfPairing,
 } from "./handshake-auth-helpers.js";
+import { revalidateFrameAuth } from "./revalidate-frame-auth.js";
 import { isUnauthorizedRoleError, UnauthorizedFloodGuard } from "./unauthorized-flood-guard.js";
 
 type SubsystemLogger = ReturnType<typeof createSubsystemLogger>;
@@ -191,6 +196,7 @@ export type GatewayWsMessageHandlerParams = {
   connectNonce: string;
   getResolvedAuth: () => ResolvedGatewayAuth;
   getRequiredSharedGatewaySessionGeneration?: () => string | undefined;
+  getTrustedProxyAuthGeneration?: () => number;
   /** Optional rate limiter for auth brute-force protection. */
   rateLimiter?: AuthRateLimiter;
   /** Browser-origin fallback limiter (loopback is never exempt). */
@@ -235,6 +241,7 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
     connectNonce,
     getResolvedAuth,
     getRequiredSharedGatewaySessionGeneration,
+    getTrustedProxyAuthGeneration,
     rateLimiter,
     browserRateLimiter,
     isStartupPending,
@@ -426,6 +433,33 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
 
         const frame = parsed;
         const connectParams = frame.params as ConnectParams;
+        const requestedScopesRaw = Array.isArray(connectParams.scopes) ? connectParams.scopes : [];
+        const scopeVocabularyResult = validateConnectScopeVocabulary(
+          requestedScopesRaw,
+          connectParams.role,
+        );
+        if (!scopeVocabularyResult.ok) {
+          const unknownPreview = scopeVocabularyResult.unknown.slice(0, 5).join(",");
+          const unknownCount = scopeVocabularyResult.unknown.length;
+          const handshakeError = `invalid connect params: unknown scope${
+            unknownCount === 1 ? "" : "s"
+          } [${unknownPreview}]`;
+          setHandshakeState("failed");
+          setCloseCause("invalid-scope-vocabulary", {
+            unknownCount,
+            unknownPreview,
+          });
+          send({
+            type: "res",
+            id: frame.id,
+            ok: false,
+            error: errorShape(ErrorCodes.INVALID_REQUEST, handshakeError, {
+              details: { unknownScopes: scopeVocabularyResult.unknown },
+            }),
+          });
+          close(1008, truncateCloseReason(handshakeError));
+          return;
+        }
         const resolvedAuth = getResolvedAuth();
         const clientLabel = connectParams.client.displayName ?? connectParams.client.id;
         const clientMeta = {
@@ -557,6 +591,18 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
         const deviceRaw = connectParams.device;
         let devicePublicKey: string | null = null;
         let deviceAuthPayloadVersion: "v2" | "v3" | null = null;
+        // Tracks whether the connection has a server-approved scope baseline
+        // (paired-device approved scopes that admit the request, or one
+        // freshly approved during connect). Without one, requested scopes are
+        // clamped to `[]` before token mint and cache, and `ensureDeviceToken`
+        // is bypassed so an attacker keypair cannot pull an existing broader
+        // token via the empty-scope reuse path in device-pairing.ts.
+        const scopeBaseline = createScopeBaselineTracker({
+          getPairedDevice,
+          getDevicePublicKey: () => devicePublicKey,
+          getRole: () => role,
+          getScopes: () => scopes,
+        });
         const hasTokenAuth = Boolean(connectParams.auth?.token);
         const hasPasswordAuth = Boolean(connectParams.auth?.password);
         const hasSharedAuth = hasTokenAuth || hasPasswordAuth;
@@ -673,14 +719,15 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
             hasSharedAuth,
             isLocalClient,
           });
-          // Shared token/password auth can bypass pairing for trusted operators.
-          // Device-less clients still clear self-declared scopes by default, with
-          // one narrow exception: the direct-local backend gateway-client shared-
-          // auth handoff used for in-process control-plane coordination.
+          // No device identity means no server-approved baseline can exist
+          // here. Clamp self-declared scopes to `[]` unless we're on a narrow
+          // explicit preserve/bypass path. Direct-local backend self-pairing
+          // is the only exception.
           if (
             !device &&
             !skipLocalBackendSelfPairing &&
-            shouldClearUnboundScopesForMissingDeviceIdentity({
+            shouldClampUnboundScopes({
+              hasApprovedScopeBaseline: false,
               decision,
               controlUiAuthPolicy,
               preserveInsecureLocalControlUiScopes,
@@ -920,32 +967,6 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
             reason: ConnectPairingRequiredReason,
             existingPairedDevice: Awaited<ReturnType<typeof getPairedDevice>> | null = null,
           ) => {
-            const pairingStateAllowsRequestedAccess = (
-              pairedCandidate: Awaited<ReturnType<typeof getPairedDevice>>,
-            ): boolean => {
-              if (!pairedCandidate || pairedCandidate.publicKey !== devicePublicKey) {
-                return false;
-              }
-              if (!hasEffectivePairedDeviceRole(pairedCandidate, role)) {
-                return false;
-              }
-              if (scopes.length === 0) {
-                return true;
-              }
-              const pairedScopes = Array.isArray(pairedCandidate.approvedScopes)
-                ? pairedCandidate.approvedScopes
-                : Array.isArray(pairedCandidate.scopes)
-                  ? pairedCandidate.scopes
-                  : [];
-              if (pairedScopes.length === 0) {
-                return false;
-              }
-              return roleScopesAllow({
-                role,
-                requestedScopes: scopes,
-                allowedScopes: pairedScopes,
-              });
-            };
             if (
               boundBootstrapProfile === null &&
               authMethod === "bootstrap-token" &&
@@ -1053,9 +1074,12 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
                   { dropIfSlow: true },
                 );
               } else {
-                resolvedByConcurrentApproval = pairingStateAllowsRequestedAccess(
-                  await getPairedDevice(device.id),
-                );
+                resolvedByConcurrentApproval = pairingStateAllowsRequestedAccess({
+                  pairedCandidate: await getPairedDevice(device.id),
+                  devicePublicKey,
+                  role,
+                  scopes,
+                });
                 let requestStillPending = false;
                 if (!resolvedByConcurrentApproval) {
                   recoveryRequestId = await resolveLivePendingRequestId();
@@ -1133,6 +1157,7 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
               if (!ok) {
                 return;
               }
+              await scopeBaseline.refreshAfterApproval(device.id);
             }
           } else {
             const claimedPlatform = connectParams.client.platform;
@@ -1164,6 +1189,7 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
               if (!ok) {
                 return;
               }
+              await scopeBaseline.refreshAfterApproval(device.id);
             } else {
               if (metadataPinning.pinnedPlatform) {
                 connectParams.client.platform = metadataPinning.pinnedPlatform;
@@ -1179,20 +1205,24 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
                 ? paired.scopes
                 : [];
             const allowedRoles = new Set(pairedRoles);
+            let roleUpgradeApproved = false;
             if (allowedRoles.size === 0) {
               logUpgradeAudit("role-upgrade", pairedRoles, pairedScopes);
               const ok = await requirePairing("role-upgrade", paired);
               if (!ok) {
                 return;
               }
+              roleUpgradeApproved = true;
             } else if (!allowedRoles.has(role)) {
               logUpgradeAudit("role-upgrade", pairedRoles, pairedScopes);
               const ok = await requirePairing("role-upgrade", paired);
               if (!ok) {
                 return;
               }
+              roleUpgradeApproved = true;
             }
 
+            let scopeUpgradeApproved = false;
             if (scopes.length > 0) {
               if (pairedScopes.length === 0) {
                 logUpgradeAudit("scope-upgrade", pairedRoles, pairedScopes);
@@ -1200,6 +1230,7 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
                 if (!ok) {
                   return;
                 }
+                scopeUpgradeApproved = true;
               } else {
                 const scopesAllowed = roleScopesAllow({
                   role,
@@ -1212,8 +1243,24 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
                   if (!ok) {
                     return;
                   }
+                  scopeUpgradeApproved = true;
                 }
               }
+            }
+
+            if (roleUpgradeApproved || scopeUpgradeApproved) {
+              await scopeBaseline.refreshAfterApproval(device.id);
+            } else if (
+              !platformMismatch &&
+              !deviceFamilyMismatch &&
+              pairingStateAllowsRequestedAccess({
+                pairedCandidate: paired,
+                devicePublicKey,
+                role,
+                scopes,
+              })
+            ) {
+              scopeBaseline.markApproved();
             }
 
             // Metadata pinning is approval-bound. Reconnects can update access metadata,
@@ -1222,9 +1269,53 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
           }
         }
 
-        const deviceToken = device
-          ? await ensureDeviceToken({ deviceId: device.id, role, scopes })
-          : null;
+        // Final scope clamp: if no server-approved baseline applies (paired
+        // device admits the request, or one freshly approved during connect),
+        // clear self-declared scopes before token mint and cache. This closes
+        // the trusted-proxy-with-attacker-keypair self-escalation path while
+        // preserving legitimate signed paired-device connects.
+        {
+          const finalTrustedProxyAuthOk = isTrustedProxyControlUiOperatorAuth({
+            isControlUi,
+            role,
+            authMode: resolvedAuth.mode,
+            authOk,
+            authMethod,
+          });
+          const finalPreserveInsecureLocalControlUiScopes =
+            isControlUi &&
+            controlUiAuthPolicy.allowInsecureAuthConfigured &&
+            isLocalClient &&
+            (authMethod === "token" || authMethod === "password");
+          if (
+            !skipLocalBackendSelfPairing &&
+            shouldClampUnboundScopes({
+              hasApprovedScopeBaseline: scopeBaseline.has(),
+              decision: { kind: "allow" },
+              controlUiAuthPolicy,
+              preserveInsecureLocalControlUiScopes: finalPreserveInsecureLocalControlUiScopes,
+              authMethod,
+              trustedProxyAuthOk: finalTrustedProxyAuthOk,
+            })
+          ) {
+            clearUnboundScopes();
+          }
+        }
+
+        // Load-bearing: gate token mint on the server-approved baseline. Without
+        // it, ensureDeviceToken can return an existing broader token to a caller
+        // whose presented public key does not match the paired record (see
+        // device-pairing.ts:939). The baseline encodes "paired record admits this
+        // connect including publicKey match" via pairingStateAllowsRequestedAccess.
+        const deviceToken =
+          device && scopeBaseline.has()
+            ? await ensureDeviceToken({
+                deviceId: device.id,
+                role,
+                scopes,
+                expectedPublicKey: devicePublicKey ?? "",
+              })
+            : null;
         const bootstrapDeviceTokens: Array<{
           deviceToken: string;
           role: string;
@@ -1256,6 +1347,7 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
               deviceId: device.id,
               role: bootstrapRole,
               scopes: bootstrapRoleScopes,
+              expectedPublicKey: devicePublicKey ?? "",
             });
             if (!extraToken) {
               continue;
@@ -1307,6 +1399,11 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
         const sharedGatewaySessionGeneration = usesSharedGatewayAuth
           ? resolveSharedGatewaySessionGeneration(resolvedAuth)
           : undefined;
+        const trustedProxyUser = authMethod === "trusted-proxy" ? authResult.user : undefined;
+        const trustedProxyAuthEvidence =
+          authMethod === "trusted-proxy" ? authResult.trustedProxyEvidence : undefined;
+        const trustedProxyAuthGeneration =
+          authMethod === "trusted-proxy" ? (getTrustedProxyAuthGeneration?.() ?? 0) : undefined;
         const scopedCanvasHostUrl =
           canvasHostUrl && canvasCapability
             ? (buildCanvasScopedHostUrl(canvasHostUrl, canvasCapability) ?? canvasHostUrl)
@@ -1324,6 +1421,9 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
           canvasHostUrl,
           canvasCapability,
           canvasCapabilityExpiresAtMs,
+          ...(trustedProxyUser !== undefined ? { trustedProxyUser } : {}),
+          ...(trustedProxyAuthGeneration !== undefined ? { trustedProxyAuthGeneration } : {}),
+          ...(trustedProxyAuthEvidence ? { trustedProxyAuthEvidence } : {}),
         };
         setSocketMaxPayload(socket, MAX_PAYLOAD_BYTES);
         if (!setClient(nextClient)) {
@@ -1537,20 +1637,18 @@ export function attachGatewayWsMessageHandler(params: GatewayWsMessageHandlerPar
       }
       const req = parsed;
       logWs("in", "req", { connId, id: req.id, method: req.method });
-      if (client.usesSharedGatewayAuth) {
-        const requiredSharedGatewaySessionGeneration =
-          getRequiredSharedGatewaySessionGeneration?.();
-        if (
-          requiredSharedGatewaySessionGeneration !== undefined &&
-          client.sharedGatewaySessionGeneration !== requiredSharedGatewaySessionGeneration
-        ) {
-          setCloseCause("gateway-auth-rotated", {
-            authGenerationStale: true,
-            method: req.method,
-          });
-          close(4001, "gateway auth changed");
-          return;
-        }
+      const frameAuthVerdict = revalidateFrameAuth({
+        client,
+        method: req.method,
+        getRequiredSharedGatewaySessionGeneration,
+        getTrustedProxyAuthGeneration,
+        getRuntimeConfig,
+        getResolvedAuthMode: () => getResolvedAuth().mode,
+      });
+      if (!frameAuthVerdict.ok) {
+        setCloseCause(frameAuthVerdict.causeReason, frameAuthVerdict.causeMeta);
+        close(frameAuthVerdict.closeCode, frameAuthVerdict.closeReason);
+        return;
       }
       const respond = (
         ok: boolean,
