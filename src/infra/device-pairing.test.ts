@@ -816,6 +816,7 @@ describe("device pairing tokens", () => {
       deviceId: "device-1",
       role: "operator",
       scopes: ["operator.admin"],
+      expectedPublicKey: "public-key-1",
       baseDir,
     });
     expect(ensured).toBeNull();
@@ -825,6 +826,28 @@ describe("device pairing tokens", () => {
     expect(after?.tokens?.operator?.scopes).toEqual(["operator.read"]);
     expect(after?.scopes).toEqual(["operator.read"]);
     expect(after?.approvedScopes).toEqual(["operator.read"]);
+  });
+
+  test("returns null when expectedPublicKey does not match paired record, even with empty requested scopes", async () => {
+    const baseDir = await makeDevicePairingDir();
+    await setupPairedOperatorDevice(baseDir, ["operator.admin"]);
+    const before = await getPairedDevice("device-1", baseDir);
+    const seededToken = requireToken(before?.tokens?.operator?.token);
+    const seededScopes = before?.tokens?.operator?.scopes ?? [];
+    expect(seededScopes).toContain("operator.admin");
+
+    const ensured = await ensureDeviceToken({
+      deviceId: "device-1",
+      role: "operator",
+      scopes: [],
+      expectedPublicKey: "attacker-public-key",
+      baseDir,
+    });
+    expect(ensured).toBeNull();
+
+    const after = await getPairedDevice("device-1", baseDir);
+    expect(after?.tokens?.operator?.token).toEqual(seededToken);
+    expect(after?.tokens?.operator?.scopes).toEqual(seededScopes);
   });
 
   test("preserves explicit empty scope baselines for node device tokens", async () => {
@@ -841,6 +864,7 @@ describe("device pairing tokens", () => {
         deviceId: "node-1",
         role: "node",
         scopes: [],
+        expectedPublicKey: "public-key-node-1",
         baseDir,
       }),
     ).resolves.toEqual(expect.objectContaining({ token: seededToken, scopes: [] }));
@@ -1000,6 +1024,7 @@ describe("device pairing tokens", () => {
         deviceId: "bootstrap-device-bounded-baseline",
         role: "operator",
         scopes: ["operator.admin"],
+        expectedPublicKey: "bootstrap-public-key-bounded-baseline",
         baseDir,
       }),
     ).resolves.toBeNull();
@@ -1055,6 +1080,7 @@ describe("device pairing tokens", () => {
         deviceId: "bootstrap-device-legacy-baseline",
         role: "operator",
         scopes: ["operator.admin"],
+        expectedPublicKey: "bootstrap-public-key-legacy-baseline-rotated",
         baseDir,
       }),
     ).resolves.toBeNull();
@@ -1155,6 +1181,7 @@ describe("device pairing tokens", () => {
         deviceId: "device-1",
         role: "operator",
         scopes: ["operator.admin"],
+        expectedPublicKey: "public-key-1",
         baseDir,
       }),
     ).resolves.toBeNull();

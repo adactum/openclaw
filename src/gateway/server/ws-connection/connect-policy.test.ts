@@ -3,8 +3,9 @@ import {
   evaluateMissingDeviceIdentity,
   isTrustedProxyControlUiOperatorAuth,
   resolveControlUiAuthPolicy,
-  shouldClearUnboundScopesForMissingDeviceIdentity,
+  shouldClampUnboundScopes,
   shouldSkipControlUiPairing,
+  validateConnectScopeVocabulary,
 } from "./connect-policy.js";
 
 describe("ws connect policy", () => {
@@ -356,7 +357,8 @@ describe("ws connect policy", () => {
     });
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "allow" },
         controlUiAuthPolicy: nonControlUi,
         preserveInsecureLocalControlUiScopes: false,
@@ -365,7 +367,8 @@ describe("ws connect policy", () => {
     ).toBe(true);
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "allow" },
         controlUiAuthPolicy: nonControlUi,
         preserveInsecureLocalControlUiScopes: false,
@@ -374,7 +377,8 @@ describe("ws connect policy", () => {
     ).toBe(true);
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "allow" },
         controlUiAuthPolicy: nonControlUi,
         preserveInsecureLocalControlUiScopes: false,
@@ -383,7 +387,8 @@ describe("ws connect policy", () => {
     ).toBe(true);
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "allow" },
         controlUiAuthPolicy: nonControlUi,
         preserveInsecureLocalControlUiScopes: false,
@@ -393,7 +398,8 @@ describe("ws connect policy", () => {
     ).toBe(true);
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "allow" },
         controlUiAuthPolicy: controlUi,
         preserveInsecureLocalControlUiScopes: true,
@@ -402,12 +408,122 @@ describe("ws connect policy", () => {
     ).toBe(false);
 
     expect(
-      shouldClearUnboundScopesForMissingDeviceIdentity({
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
+        decision: { kind: "allow" },
+        controlUiAuthPolicy: controlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: "none",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
+        decision: { kind: "allow" },
+        controlUiAuthPolicy: controlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: "tailscale",
+      }),
+    ).toBe(false);
+
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
+        decision: { kind: "allow" },
+        controlUiAuthPolicy: controlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: "trusted-proxy",
+        trustedProxyAuthOk: true,
+      }),
+    ).toBe(true);
+
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: false,
         decision: { kind: "reject-device-required" },
         controlUiAuthPolicy: nonControlUi,
         preserveInsecureLocalControlUiScopes: false,
         authMethod: undefined,
       }),
     ).toBe(true);
+  });
+
+  test("does not clamp when an approved scope baseline applies", () => {
+    const nonControlUi = resolveControlUiAuthPolicy({
+      isControlUi: false,
+      controlUiConfig: undefined,
+      deviceRaw: null,
+    });
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: true,
+        decision: { kind: "allow" },
+        controlUiAuthPolicy: nonControlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: "trusted-proxy",
+      }),
+    ).toBe(false);
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: true,
+        decision: { kind: "allow" },
+        controlUiAuthPolicy: nonControlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: "token",
+      }),
+    ).toBe(false);
+  });
+
+  test("clamps even with approved baseline when device-required decision rejects", () => {
+    const nonControlUi = resolveControlUiAuthPolicy({
+      isControlUi: false,
+      controlUiConfig: undefined,
+      deviceRaw: null,
+    });
+    expect(
+      shouldClampUnboundScopes({
+        hasApprovedScopeBaseline: true,
+        decision: { kind: "reject-device-required" },
+        controlUiAuthPolicy: nonControlUi,
+        preserveInsecureLocalControlUiScopes: false,
+        authMethod: undefined,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("validateConnectScopeVocabulary", () => {
+  test("accepts known operator scopes", () => {
+    const result = validateConnectScopeVocabulary(["operator.admin", "operator.read"]);
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects unknown tokens", () => {
+    const result = validateConnectScopeVocabulary(["operator.admin", "operator.bogus"]);
+    expect(result).toEqual({ ok: false, unknown: ["operator.bogus"] });
+  });
+
+  test("rejects non-string tokens with type tag", () => {
+    const result = validateConnectScopeVocabulary([42, "operator.admin"]);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.unknown[0]).toBe("<non-string:number>");
+    }
+  });
+
+  test("accepts node.* prefix tokens for node role", () => {
+    const result = validateConnectScopeVocabulary(["node.foo", "node.bar"], "node");
+    expect(result.ok).toBe(true);
+  });
+
+  test("rejects bare 'node.' (empty suffix) for node role", () => {
+    const result = validateConnectScopeVocabulary(["node."], "node");
+    expect(result.ok).toBe(false);
+  });
+
+  test("rejects node.* tokens when role is not node", () => {
+    const result = validateConnectScopeVocabulary(["node.foo"], "operator");
+    expect(result.ok).toBe(false);
   });
 });

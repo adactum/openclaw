@@ -247,6 +247,34 @@ async function configureTrustedProxyControlUiAuth() {
   });
 }
 
+async function configureTrustedProxyControlUiAuthAllowingLoopback() {
+  const { replaceConfigFile } = await import("../config/config.js");
+  testState.gatewayAuth = undefined;
+  testState.gatewayControlUi = {
+    ...testState.gatewayControlUi,
+    allowedOrigins: ["https://localhost"],
+  };
+  await replaceConfigFile({
+    nextConfig: {
+      gateway: {
+        auth: {
+          mode: "trusted-proxy",
+          trustedProxy: {
+            userHeader: "x-forwarded-user",
+            requiredHeaders: ["x-forwarded-proto"],
+            allowLoopback: true,
+          },
+        },
+        trustedProxies: ["127.0.0.1"],
+        controlUi: {
+          allowedOrigins: ["https://localhost"],
+        },
+      },
+    },
+    afterWrite: { mode: "auto" },
+  });
+}
+
 async function writeTrustedProxyControlUiConfig(params?: { allowInsecureAuth?: boolean }) {
   const { replaceConfigFile } = await import("../config/config.js");
   const nextConfig = {
@@ -382,6 +410,7 @@ export {
   BACKEND_GATEWAY_CLIENT,
   buildDeviceAuthPayload,
   configureTrustedProxyControlUiAuth,
+  configureTrustedProxyControlUiAuthAllowingLoopback,
   connectReq,
   CONTROL_UI_CLIENT,
   createSignedDevice,

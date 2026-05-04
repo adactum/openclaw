@@ -48,6 +48,11 @@ export type GatewayAuthResult = {
   rateLimited?: boolean;
   /** Milliseconds the client should wait before retrying (when rate-limited). */
   retryAfterMs?: number;
+  /**
+   * Present when method is `trusted-proxy`. Captures the non-secret evidence
+   * the WS layer needs to cache for stale-generation revalidation.
+   */
+  trustedProxyEvidence?: TrustedProxyAuthEvidence;
 };
 
 type ConnectAuth = {
@@ -261,15 +266,24 @@ export function assertGatewayAuthConfigured(
   }
 }
 
+export type TrustedProxyAuthEvidence = {
+  remoteAddr: string;
+  isLoopback: boolean;
+  requiredHeadersPresented: ReadonlyArray<string>;
+  userHeaderName: string;
+};
+
 /**
  * Check if the request came from a trusted proxy and extract user identity.
- * Returns the user identity if valid, or null with a reason if not.
+ * On success, returns the resolved user along with non-secret evidence the
+ * WebSocket layer caches on the live client to revalidate the session against
+ * later trusted-proxy policy changes.
  */
 function authorizeTrustedProxy(params: {
   req?: IncomingMessage;
   trustedProxies?: string[];
   trustedProxyConfig: GatewayTrustedProxyConfig;
-}): { user: string } | { reason: string } {
+}): { user: string; evidence: TrustedProxyAuthEvidence } | { reason: string } {
   const { req, trustedProxies, trustedProxyConfig } = params;
 
   if (!req) {
@@ -280,21 +294,24 @@ function authorizeTrustedProxy(params: {
   if (!remoteAddr || !isTrustedProxyAddress(remoteAddr, trustedProxies)) {
     return { reason: "trusted_proxy_untrusted_source" };
   }
-  if (isLoopbackAddress(remoteAddr) && trustedProxyConfig.allowLoopback !== true) {
+  const isLoopback = isLoopbackAddress(remoteAddr);
+  if (isLoopback && trustedProxyConfig.allowLoopback !== true) {
     return { reason: "trusted_proxy_loopback_source" };
   }
 
   const requiredHeaders = trustedProxyConfig.requiredHeaders ?? [];
+  const requiredHeadersPresented: string[] = [];
   for (const header of requiredHeaders) {
-    const value = headerValue(req.headers[normalizeLowercaseStringOrEmpty(header)]);
+    const normalizedName = normalizeLowercaseStringOrEmpty(header);
+    const value = headerValue(req.headers[normalizedName]);
     if (!value || value.trim() === "") {
       return { reason: `trusted_proxy_missing_header_${header}` };
     }
+    requiredHeadersPresented.push(normalizedName);
   }
 
-  const userHeaderValue = headerValue(
-    req.headers[normalizeLowercaseStringOrEmpty(trustedProxyConfig.userHeader)],
-  );
+  const userHeaderName = normalizeLowercaseStringOrEmpty(trustedProxyConfig.userHeader);
+  const userHeaderValue = headerValue(req.headers[userHeaderName]);
   if (!userHeaderValue || userHeaderValue.trim() === "") {
     return { reason: "trusted_proxy_user_missing" };
   }
@@ -306,7 +323,68 @@ function authorizeTrustedProxy(params: {
     return { reason: "trusted_proxy_user_not_allowed" };
   }
 
-  return { user };
+  return {
+    user,
+    evidence: {
+      remoteAddr,
+      isLoopback,
+      requiredHeadersPresented,
+      userHeaderName,
+    },
+  };
+}
+
+/**
+ * Re-applies the connect-time trusted-proxy policy checks against cached
+ * evidence and the current config. Used by the per-frame stale-generation
+ * guard and the post-config-write disconnect helper to decide whether a
+ * still-open session should be force-closed.
+ *
+ * Missing config or missing evidence fails closed.
+ */
+export function evaluateCachedTrustedProxySession(params: {
+  user: string;
+  evidence: TrustedProxyAuthEvidence | undefined;
+  trustedProxyConfig: GatewayTrustedProxyConfig | undefined;
+  trustedProxies: readonly string[] | undefined;
+  gatewayAuthMode: string | undefined;
+}): { ok: true } | { ok: false; reason: string } {
+  const { user, evidence, trustedProxyConfig, trustedProxies, gatewayAuthMode } = params;
+  if (gatewayAuthMode !== "trusted-proxy") {
+    return { ok: false, reason: "trusted_proxy_auth_mode_inactive" };
+  }
+  if (!trustedProxyConfig) {
+    return { ok: false, reason: "trusted_proxy_config_missing" };
+  }
+  if (!evidence) {
+    return { ok: false, reason: "trusted_proxy_evidence_missing" };
+  }
+  if (!trustedProxies || trustedProxies.length === 0) {
+    return { ok: false, reason: "trusted_proxy_no_proxies_configured" };
+  }
+  if (!isTrustedProxyAddress(evidence.remoteAddr, [...trustedProxies])) {
+    return { ok: false, reason: "trusted_proxy_untrusted_source" };
+  }
+  if (evidence.isLoopback && trustedProxyConfig.allowLoopback !== true) {
+    return { ok: false, reason: "trusted_proxy_loopback_source" };
+  }
+  const requiredHeaders = trustedProxyConfig.requiredHeaders ?? [];
+  const presented = new Set(evidence.requiredHeadersPresented);
+  for (const header of requiredHeaders) {
+    const normalized = normalizeLowercaseStringOrEmpty(header);
+    if (!presented.has(normalized)) {
+      return { ok: false, reason: `trusted_proxy_missing_header_${header}` };
+    }
+  }
+  const currentUserHeader = normalizeLowercaseStringOrEmpty(trustedProxyConfig.userHeader);
+  if (currentUserHeader !== evidence.userHeaderName) {
+    return { ok: false, reason: "trusted_proxy_user_header_changed" };
+  }
+  const allowUsers = trustedProxyConfig.allowUsers ?? [];
+  if (allowUsers.length > 0 && !allowUsers.includes(user)) {
+    return { ok: false, reason: "trusted_proxy_user_not_allowed" };
+  }
+  return { ok: true };
 }
 
 function shouldAllowTailscaleHeaderAuth(authSurface: GatewayAuthSurface): boolean {
@@ -464,7 +542,12 @@ async function authorizeGatewayConnectCore(
       if (originResult) {
         return originResult;
       }
-      return { ok: true, method: "trusted-proxy", user: result.user };
+      return {
+        ok: true,
+        method: "trusted-proxy",
+        user: result.user,
+        trustedProxyEvidence: result.evidence,
+      };
     }
     if (localDirect && auth.password && connectAuth?.password) {
       if (limiter) {

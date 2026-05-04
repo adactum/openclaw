@@ -1,3 +1,13 @@
+import {
+  validateOperatorScopeArray,
+  type OperatorScopeArrayValidationResult,
+} from "../../operator-scopes.js";
+// `connect.params.scopes` is never authoritative on any branch. It is at most a
+// hint that must be intersected with a server-derived baseline (paired-device
+// approved scopes when paired or freshly approved during connect, or a
+// bootstrap profile). When no such baseline exists, the cached scope set must
+// be cleared to `[]` regardless of what the client requested. Authentication
+// proves identity; pairing/bootstrap proves scope authority.
 import type { ConnectParams } from "../../protocol/index.js";
 import type { GatewayRole } from "../../role-policy.js";
 import { roleCanSkipDeviceIdentity } from "../../role-policy.js";
@@ -85,24 +95,70 @@ export type MissingDeviceIdentityDecision =
   | { kind: "reject-unauthorized" }
   | { kind: "reject-device-required" };
 
-export function shouldClearUnboundScopesForMissingDeviceIdentity(params: {
+function validateNodeScopeVocabulary(
+  scopes: readonly unknown[],
+): OperatorScopeArrayValidationResult {
+  const unknownTokens: string[] = [];
+  for (const value of scopes) {
+    if (typeof value === "string" && value.startsWith("node.") && value.length > "node.".length) {
+      continue;
+    }
+    unknownTokens.push(typeof value === "string" ? value : `<non-string:${typeof value}>`);
+  }
+  if (unknownTokens.length === 0) {
+    return { ok: true };
+  }
+  return { ok: false, unknown: unknownTokens };
+}
+
+export function validateConnectScopeVocabulary(
+  scopes: readonly unknown[],
+  role?: string,
+): OperatorScopeArrayValidationResult {
+  if (typeof role === "string" && role.trim() === "node") {
+    return validateNodeScopeVocabulary(scopes);
+  }
+  return validateOperatorScopeArray(scopes);
+}
+
+/**
+ * Returns true when the WebSocket connection lacks a server-approved scope
+ * baseline and is not covered by an existing explicit preserve/bypass
+ * condition. The primary input is `hasApprovedScopeBaseline` — never raw
+ * device presence, since an attacker-controlled keypair makes `device`
+ * truthy without conferring any actual authority.
+ */
+export function shouldClampUnboundScopes(params: {
+  hasApprovedScopeBaseline: boolean;
   decision: MissingDeviceIdentityDecision;
   controlUiAuthPolicy: ControlUiAuthPolicy;
   preserveInsecureLocalControlUiScopes: boolean;
   authMethod: string | undefined;
   trustedProxyAuthOk?: boolean;
 }): boolean {
-  return (
-    params.decision.kind !== "allow" ||
-    (!params.controlUiAuthPolicy.allowBypass &&
-      !params.preserveInsecureLocalControlUiScopes &&
-      // trusted-proxy auth can bypass pairing for some clients, but those
-      // self-declared scopes are still unbound without device identity.
-      (params.authMethod === "token" ||
-        params.authMethod === "password" ||
-        params.authMethod === "trusted-proxy" ||
-        params.trustedProxyAuthOk === true))
-  );
+  if (params.decision.kind !== "allow") {
+    return true;
+  }
+  if (params.hasApprovedScopeBaseline) {
+    return false;
+  }
+  if (params.controlUiAuthPolicy.allowBypass && params.authMethod !== "trusted-proxy") {
+    return false;
+  }
+  // Control UI deployments in open-auth and Tailscale-authenticated modes
+  // intentionally bypass pairing for operator UI clients; keep their declared
+  // scopes bound to that server-side auth mode. Trusted-proxy is excluded by
+  // design because proxy identity alone must not reuse or mint device authority.
+  if (
+    params.controlUiAuthPolicy.isControlUi &&
+    (params.authMethod === "none" || params.authMethod === "tailscale")
+  ) {
+    return false;
+  }
+  if (params.preserveInsecureLocalControlUiScopes) {
+    return false;
+  }
+  return true;
 }
 
 export function evaluateMissingDeviceIdentity(params: {

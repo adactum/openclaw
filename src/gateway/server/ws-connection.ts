@@ -128,6 +128,11 @@ export type GatewayWsSharedHandlerParams = {
   resolvedAuth: ResolvedGatewayAuth;
   getResolvedAuth?: () => ResolvedGatewayAuth;
   getRequiredSharedGatewaySessionGeneration?: () => string | undefined;
+  /**
+   * Returns the current monotonic trusted-proxy auth generation. The connect
+   * handler snapshots it on connect and the per-frame guard checks for drift.
+   */
+  getTrustedProxyAuthGeneration?: () => number;
   /** Optional rate limiter for auth brute-force protection. */
   rateLimiter?: AuthRateLimiter;
   /** Browser-origin fallback limiter (loopback is never exempt). */
@@ -204,6 +209,7 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
     getResolvedAuth = () => resolvedAuth,
     getRequiredSharedGatewaySessionGeneration = () =>
       resolveSharedGatewaySessionGeneration(getResolvedAuth()),
+    getTrustedProxyAuthGeneration = () => 0,
     rateLimiter,
     browserRateLimiter,
     isStartupPending,
@@ -445,6 +451,7 @@ export function attachGatewayWsConnectionHandler(params: AttachGatewayWsConnecti
       connectNonce,
       getResolvedAuth,
       getRequiredSharedGatewaySessionGeneration,
+      getTrustedProxyAuthGeneration,
       rateLimiter,
       browserRateLimiter,
       isStartupPending,

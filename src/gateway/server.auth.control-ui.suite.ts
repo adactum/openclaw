@@ -6,6 +6,7 @@ import {
   BACKEND_GATEWAY_CLIENT,
   connectReq,
   configureTrustedProxyControlUiAuth,
+  configureTrustedProxyControlUiAuthAllowingLoopback,
   CONTROL_UI_CLIENT,
   ConnectErrorDetailCodes,
   createSignedDevice,
@@ -72,10 +73,11 @@ export function registerControlUiAndPairingSuite(): void {
     client: { id: string; mode: string };
     nonce: string;
     scopes: string[];
+    token?: string | null;
     role?: "operator" | "node";
   }) => {
     const { device } = await createSignedDevice({
-      token: "secret",
+      token: params.token === undefined ? "secret" : params.token,
       scopes: params.scopes,
       clientId: params.client.id,
       clientMode: params.client.mode,
@@ -739,6 +741,91 @@ export function registerControlUiAndPairingSuite(): void {
     ws2.close();
     await server.close();
     restoreGatewayToken(prevToken);
+  });
+
+  test("trusted-proxy + ControlUI cannot self-escalate via attacker keypair against an approved admin pairing", async () => {
+    // Spec 1 regression: trusted-proxy ControlUI auth bypasses pairing for
+    // operator role, and an attacker-supplied keypair satisfies the device
+    // signature gate. The connect must succeed (binary-identity admit) but
+    // must not mint or reuse the legitimate paired admin token. Without the
+    // hasApprovedScopeBaseline gate at the token-mint site, ensureDeviceToken
+    // returns the existing admin token because requested scopes are clamped
+    // to [] and `roleScopesAllow([])` is trivially true.
+    await configureTrustedProxyControlUiAuthAllowingLoopback();
+    const { identity, identityPath } = await seedApprovedOperatorReadPairing({
+      identityPrefix: "openclaw-tp-self-escalation-",
+      clientId: TEST_OPERATOR_CLIENT.id,
+      clientMode: TEST_OPERATOR_CLIENT.mode,
+      displayName: "self-escalation-target",
+      platform: TEST_OPERATOR_CLIENT.platform,
+      scopes: ["operator.admin"],
+    });
+    // Mutate the paired record's stored publicKey so it no longer matches the
+    // legitimate identity's signed device frame. The signed handshake remains
+    // internally consistent (passes derivation guard) but pairingState fails
+    // baseline => hasApprovedScopeBaseline stays false.
+    await overwritePairedPublicKey(identity.deviceId, "mismatched-public-key");
+    await withControlUiGatewayServer(async ({ port }) => {
+      // Case A: declare scopes:[] and rely on token-reuse path.
+      let ws = await openWs(port, TRUSTED_PROXY_CONTROL_UI_HEADERS);
+      try {
+        const nonce = await readConnectChallengeNonce(ws);
+        const device = await buildSignedDeviceForIdentity({
+          identityPath,
+          client: CONTROL_UI_CLIENT,
+          scopes: [],
+          token: null,
+          nonce,
+        });
+        const res = await connectReq(ws, {
+          skipDefaultAuth: true,
+          role: "operator",
+          scopes: [],
+          device,
+          client: { ...CONTROL_UI_CLIENT },
+        });
+        expect(res.ok).toBe(true);
+        const helloAuth = (res.payload as { auth?: { scopes?: string[]; deviceToken?: string } })
+          ?.auth;
+        expect(helloAuth?.scopes ?? []).not.toContain("operator.admin");
+        expect(helloAuth?.deviceToken).toBeUndefined();
+        const adminAttempt = await rpcReq(ws, "config.apply", {});
+        expect(adminAttempt.ok).toBe(false);
+      } finally {
+        ws.close();
+      }
+      // Case B: declare scopes:["operator.admin"] explicitly.
+      ws = await openWs(port, TRUSTED_PROXY_CONTROL_UI_HEADERS);
+      try {
+        const nonce = await readConnectChallengeNonce(ws);
+        const device = await buildSignedDeviceForIdentity({
+          identityPath,
+          client: CONTROL_UI_CLIENT,
+          scopes: ["operator.admin"],
+          token: null,
+          nonce,
+        });
+        const res = await connectReq(ws, {
+          skipDefaultAuth: true,
+          role: "operator",
+          scopes: ["operator.admin"],
+          device,
+          client: { ...CONTROL_UI_CLIENT },
+        });
+        // Deterministic per spec 1 equivalence argument: connect succeeds
+        // (binary-identity admit), scopes clamp to [], no device token, and
+        // any admin-scope-gated method is denied at the per-method gate.
+        expect(res.ok).toBe(true);
+        const helloAuth = (res.payload as { auth?: { scopes?: string[]; deviceToken?: string } })
+          ?.auth;
+        expect(helloAuth?.scopes ?? []).toEqual([]);
+        expect(helloAuth?.deviceToken).toBeUndefined();
+        const adminAttempt = await rpcReq(ws, "config.apply", {});
+        expect(adminAttempt.ok).toBe(false);
+      } finally {
+        ws.close();
+      }
+    });
   });
 
   test("does not expose approved access when a paired device id reconnects with a different key", async () => {

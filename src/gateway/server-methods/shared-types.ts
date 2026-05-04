@@ -67,6 +67,12 @@ export type GatewayRequestContext = {
   disconnectClientsForDevice?: (deviceId: string, opts?: { role?: string }) => void;
   disconnectClientsUsingSharedGatewayAuth?: () => void;
   enforceSharedGatewayAuthGenerationForConfigWrite?: (nextConfig: OpenClawConfig) => void;
+  /**
+   * Single instance-owned trusted-proxy auth-change applicator. Routes both
+   * the in-process config-write trigger and the reloader trigger through one
+   * fingerprint-deduplicated dispatch.
+   */
+  applyTrustedProxyAuthChange?: (prev: OpenClawConfig, next: OpenClawConfig) => void;
   nodeRegistry: NodeRegistry;
   agentRunSeq: Map<string, number>;
   chatAbortControllers: Map<string, ChatAbortControllerEntry>;

@@ -36,6 +36,7 @@ describe("createGatewayRequestContext", () => {
       hasConnectedMobileNode: vi.fn(() => false),
       clients: new Set(),
       enforceSharedGatewayAuthGenerationForConfigWrite: vi.fn(),
+      applyTrustedProxyAuthChange: vi.fn(),
       nodeRegistry: {} as never,
       agentRunSeq: new Map(),
       chatAbortControllers: new Map(),

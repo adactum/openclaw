@@ -449,3 +449,129 @@ If you're moving from token auth to trusted-proxy:
 - [Remote access](/gateway/remote) — other remote access patterns
 - [Security](/gateway/security) — full security guide
 - [Tailscale](/gateway/tailscale) — simpler alternative for tailnet-only access
+
+## WebSocket session lifecycle and revocation
+
+OpenClaw treats trusted-proxy authentication as identity, not authority. The
+proxy headers prove who the request came from; pairing and bootstrap prove
+what scopes that identity is allowed to exercise. WebSocket sessions enforce
+this at three points: connect-time scope clamp, token-mint baseline gate, and
+per-frame revalidation.
+
+### Self-declared scope clamp
+
+For trusted-proxy auth, `connect.params.scopes` is never authoritative.
+WebSocket connect intersects it with a server-derived baseline:
+
+- **Paired-device baseline**: the paired record's `approvedScopes` (or legacy
+  `scopes`) admit the requested role and scopes via `roleScopesAllow`. The
+  paired record's stored `publicKey` must match the public key the caller
+  signed with.
+- **Bootstrap baseline**: a valid bootstrap profile drives scopes server-side.
+- **Freshly approved baseline**: a `requirePairing` round-trip approval that
+  inserted or updated the pairing record during the connect.
+
+Without an approved baseline, requested `connect.params.scopes` is clamped to
+`[]` before token mint and cache. A trusted-proxy authenticated caller that
+ships any keypair as `connect.params.device` (cryptographic possession only,
+not pairing) cannot self-escalate by self-declaring scopes.
+
+These non-trusted-proxy Control UI paths intentionally preserve
+self-declared scopes. They are either operator opt-in or bound to another
+server-side auth mode, and they do not apply to trusted-proxy auth:
+
+- **Control UI auth-bypass**: when `gateway.controlUi.allowBypass` is configured,
+  the operator has explicitly opted out of Control UI auth at this Gateway.
+  The clamp does not apply. Operators using bypass must trust their Gateway's
+  network surface; this is a documented opt-in, not a default.
+- **Open-auth Control UI**: when the effective auth method is `none`, the
+  Gateway is running without Control UI auth by operator choice. The clamp does
+  not apply because pairing is intentionally bypassed for that open-auth UI
+  mode.
+- **Tailscale-authenticated Control UI**: when the effective auth method is
+  `tailscale`, the Gateway has accepted the request through the Tailscale
+  Control UI auth path. The clamp does not apply because pairing is
+  intentionally bypassed for that server-side auth mode.
+- **Insecure-local Control UI**: when `gateway.controlUi.allowInsecureAuth` is
+  set AND the request is loopback AND the auth method is `token` or
+  `password` (shared-secret presented locally), the clamp does not apply.
+  This preserves the legacy local-development workflow; it is rejected in any
+  non-loopback context.
+
+The trusted-proxy attacker-keypair self-escalation path remains closed in all
+configurations: trusted-proxy auth (`authMethod === "trusted-proxy"`) does not
+match any of these branches.
+
+### Token mint baseline gate
+
+`ensureDeviceToken` issues a fresh token only when the connect has an
+approved scope baseline. Without that gate, the token API can return an
+existing broader token for the supplied `device.id` — empty requested scopes
+trivially fit any approved baseline, and the existing-token reuse branch
+returns whatever was previously minted. Trusted-proxy connections without a
+matching paired publicKey therefore receive **no device token** in
+`helloOk.auth`, regardless of what the legitimate paired record holds.
+
+### Per-frame stale-generation guard
+
+A monotonic generation counter is bumped whenever trusted-proxy auth config
+changes (mode, `userHeader`, `requiredHeaders`, `allowUsers`,
+`allowLoopback`, or `gateway.trustedProxies`). Each connected client snapshots
+the current generation. When a frame arrives, the guard compares the cached
+generation to the current one; on drift it re-evaluates the cached non-secret
+evidence (remote address, loopback classification, presented header names,
+user-header name) plus user identity against the live config. On mismatch the
+session is closed with code **4001** (`trusted-proxy auth revoked` or
+`gateway auth changed`).
+
+### Config-change behavior
+
+Live trusted-proxy WS sessions are evicted proactively after every config
+write according to the following table. The set difference `prev \ next` is
+applied across `allowUsers`; an empty `allowUsers` means **allow all users**,
+so the relevant axis is membership, not cardinality.
+
+| Transition                                                                                                                                                                            | Action                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| `[] → []`                                                                                                                                                                             | none                                                         |
+| `empty (allow-all) → finite`                                                                                                                                                          | revalidate (close non-allowlisted, keep allowlisted)         |
+| `finite → empty (allow-all)`                                                                                                                                                          | none (loosen)                                                |
+| `finite → finite, removed users non-empty`                                                                                                                                            | per-user close removed users                                 |
+| `finite → finite, no removals (same / grow)`                                                                                                                                          | none                                                         |
+| header / source / loopback / mode tighten (`userHeader` rename, `requiredHeader` add, `allowLoopback: true → false`, `trustedProxy` CIDR removal, `mode` flip out of `trusted-proxy`) | bulk close all trusted-proxy clients (orthogonal precedence) |
+
+For example, replacing `["alice"]` with `["bob"]` evicts Alice — the same
+cardinality is irrelevant; Alice is no longer allowed. Removing Alice from
+`["alice", "bob"]` evicts Alice and leaves Bob. Adding Carol to
+`["alice", "bob"]` evicts no one. Renaming `userHeader` from
+`x-forwarded-user` to `x-tenant-user` triggers a bulk close because the cached
+evidence shape no longer matches the live policy.
+
+### Operator runbook: revoking a user
+
+To force-disconnect a previously allowed trusted-proxy user without restarting
+the Gateway:
+
+1. Apply a config edit that adds the user to a finite `allowUsers` list (or
+   removes them from one). Use `openclaw config patch
+gateway.auth.trustedProxy.allowUsers '...'` or write the file directly.
+2. The post-write follow-up runs the disconnect plan; matching sessions close
+   immediately with code 4001 and reason `trusted-proxy auth revoked`.
+3. Subsequent reconnect attempts that present the now-disallowed user header
+   value fail at connect-time auth (`trusted_proxy_user_not_allowed`).
+
+The live revocation channel only exists between OpenClaw and the proxy
+configuration. **OpenClaw cannot detect revocations made only at the upstream
+identity provider** without an explicit signal — if your IdP de-provisions a
+user but the OpenClaw `allowUsers` list still includes them, their existing
+WS session continues until the proxy itself terminates the connection or you
+edit `allowUsers`. Operators are encouraged to mirror IdP group membership
+into `allowUsers`, or to terminate WS connections at the proxy layer on
+identity revocation.
+
+### Scope vocabulary validation
+
+`connect.params.scopes` is validated against the operator-scope vocabulary at
+connect; unknown tokens are rejected with `INVALID_REQUEST: unknown scope`.
+For node-role connects, scopes prefixed with `node.` are accepted as
+node-owned; the prefix carve-out applies only when `role === "node"`.

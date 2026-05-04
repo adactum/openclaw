@@ -79,6 +79,14 @@ import {
   startGatewayPluginDiscovery,
   startGatewayPostAttachRuntime,
 } from "./server-startup.js";
+import {
+  closeTrustedProxyClient,
+  createTrustedProxyAuthApplicator,
+  createTrustedProxyAuthGenerationState,
+  disconnectAllTrustedProxyClients,
+  disconnectStaleTrustedProxyClients,
+  TRUSTED_PROXY_REVOKED_CLOSE_REASON,
+} from "./server-trusted-proxy-auth-generation.js";
 import { createWizardSessionTracker } from "./server-wizard-sessions.js";
 import { createGatewayEventLoopHealthMonitor } from "./server/event-loop-health.js";
 import {
@@ -695,6 +703,13 @@ export async function startGatewayServer(
       env: process.env,
       tailscaleMode,
     });
+  const resolveGatewayAuthModeForConfig = (config: OpenClawConfig) =>
+    resolveGatewayAuth({
+      authConfig: config.gateway?.auth,
+      authOverride: opts.auth,
+      env: process.env,
+      tailscaleMode,
+    }).mode;
   const resolveSharedGatewaySessionGenerationForConfig = (config: OpenClawConfig) =>
     resolveSharedGatewaySessionGeneration(
       resolveGatewayAuth({
@@ -719,6 +734,12 @@ export async function startGatewayServer(
     current: resolveCurrentSharedGatewaySessionGeneration(),
     required: null,
   };
+  const trustedProxyAuthGenerationState = createTrustedProxyAuthGenerationState();
+  const getTrustedProxyAuthGeneration = () => trustedProxyAuthGenerationState.get();
+  const bumpTrustedProxyAuthGeneration = () => trustedProxyAuthGenerationState.bump();
+  const trustedProxyAuthApplicator = createTrustedProxyAuthApplicator(cfgAtStart, {
+    resolvedAuthMode: resolvedAuth.mode,
+  });
   const preauthHandshakeTimeoutMs =
     cfgAtStart.gateway?.handshakeTimeoutMs ?? getRuntimeConfig().gateway?.handshakeTimeoutMs;
   const initialHooksConfig = runtimeConfig.hooksConfig;
@@ -1186,6 +1207,37 @@ export async function startGatewayServer(
     const unavailableGatewayMethods = new Set<string>(
       minimalTestGateway ? [] : STARTUP_UNAVAILABLE_GATEWAY_METHODS,
     );
+    // Single dispatch closure for trusted-proxy auth-change. Both triggers
+    // (in-process config write via GatewayRequestContext, reloader path) call
+    // the same applicator instance; the applicator dedups via last-applied
+    // fingerprint primed from cfgAtStart.
+    const applyTrustedProxyAuthChange = (prev: OpenClawConfig, next: OpenClawConfig): void => {
+      const prevResolvedAuthMode = resolveGatewayAuthModeForConfig(prev);
+      const nextResolvedAuthMode = resolveGatewayAuthModeForConfig(next);
+      trustedProxyAuthApplicator.apply(
+        prev,
+        next,
+        {
+          bumpTrustedProxyAuthGeneration,
+          disconnectAllTrustedProxyClients: (opts) =>
+            disconnectAllTrustedProxyClients(clients, opts),
+          disconnectRevokedTrustedProxyClients: (nextCfg) =>
+            disconnectStaleTrustedProxyClients(clients, nextCfg, {
+              resolvedAuthMode: nextResolvedAuthMode,
+            }),
+          disconnectClientsForTrustedProxyUser: (user, opts) => {
+            const reason = opts?.reason ?? TRUSTED_PROXY_REVOKED_CLOSE_REASON;
+            for (const gatewayClient of clients) {
+              if (gatewayClient.trustedProxyUser !== user) {
+                continue;
+              }
+              closeTrustedProxyClient(gatewayClient, reason);
+            }
+          },
+        },
+        { prevResolvedAuthMode, nextResolvedAuthMode },
+      );
+    };
     const { createGatewayRequestContext } = await import("./server-request-context.js");
     const gatewayRequestContext = createGatewayRequestContext({
       deps,
@@ -1217,6 +1269,7 @@ export async function startGatewayServer(
           clients,
         });
       },
+      applyTrustedProxyAuthChange,
       nodeRegistry,
       agentRunSeq,
       chatAbortControllers,
@@ -1293,6 +1346,7 @@ export async function startGatewayServer(
       getResolvedAuth,
       getRequiredSharedGatewaySessionGeneration: () =>
         getRequiredSharedGatewaySessionGeneration(sharedGatewaySessionGenerationState),
+      getTrustedProxyAuthGeneration,
       rateLimiter: authRateLimiter,
       browserRateLimiter: browserAuthRateLimiter,
       preauthHandshakeTimeoutMs,
@@ -1443,6 +1497,7 @@ export async function startGatewayServer(
       resolveSharedGatewaySessionGenerationForConfig,
       sharedGatewaySessionGenerationState,
       clients,
+      applyTrustedProxyAuthChange,
     });
     await promoteConfigSnapshotToLastKnownGood(startupLastGoodSnapshot).catch((err) => {
       log.warn(`gateway: failed to promote config last-known-good backup: ${String(err)}`);

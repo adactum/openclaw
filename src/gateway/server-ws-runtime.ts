@@ -33,6 +33,7 @@ export function attachGatewayWsHandlers(params: GatewayWsRuntimeParams) {
     resolvedAuth: params.resolvedAuth,
     getResolvedAuth: params.getResolvedAuth,
     getRequiredSharedGatewaySessionGeneration: params.getRequiredSharedGatewaySessionGeneration,
+    getTrustedProxyAuthGeneration: params.getTrustedProxyAuthGeneration,
     rateLimiter: params.rateLimiter,
     browserRateLimiter: params.browserRateLimiter,
     preauthHandshakeTimeoutMs: params.preauthHandshakeTimeoutMs,

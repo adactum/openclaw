@@ -27,3 +27,23 @@ const KNOWN_OPERATOR_SCOPES: ReadonlySet<OperatorScope> = new Set(KNOWN_OPERATOR
 export function isOperatorScope(value: unknown): value is OperatorScope {
   return typeof value === "string" && KNOWN_OPERATOR_SCOPES.has(value as OperatorScope);
 }
+
+export type OperatorScopeArrayValidationResult =
+  | { ok: true }
+  | { ok: false; unknown: string[] };
+
+export function validateOperatorScopeArray(
+  scopes: readonly unknown[],
+): OperatorScopeArrayValidationResult {
+  const unknownTokens: string[] = [];
+  for (const value of scopes) {
+    if (isOperatorScope(value)) {
+      continue;
+    }
+    unknownTokens.push(typeof value === "string" ? value : `<non-string:${typeof value}>`);
+  }
+  if (unknownTokens.length === 0) {
+    return { ok: true };
+  }
+  return { ok: false, unknown: unknownTokens };
+}

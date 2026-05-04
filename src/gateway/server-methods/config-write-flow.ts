@@ -70,6 +70,23 @@ function queueSharedGatewayAuthDisconnect(
   });
 }
 
+function queueTrustedProxyAuthFollowUp(params: {
+  prevConfig: OpenClawConfig;
+  nextConfig: OpenClawConfig;
+  context?: GatewayRequestContext;
+}): void {
+  const { prevConfig, nextConfig, context } = params;
+  if (!context) {
+    return;
+  }
+  // Immediate post-write revocation: the microtask runs before the next WS
+  // frame is processed, closing the stale-frame race window. The applicator
+  // dedups against the reloader trigger via instance-owned fingerprint state.
+  queueMicrotask(() => {
+    context.applyTrustedProxyAuthChange?.(prevConfig, nextConfig);
+  });
+}
+
 function queueSharedGatewayAuthGenerationRefresh(
   shouldRefresh: boolean,
   nextConfig: OpenClawConfig,
@@ -169,6 +186,7 @@ export async function commitGatewayConfigWrite(params: {
   context?: GatewayRequestContext;
   disconnectSharedAuthClients?: boolean;
 }): Promise<{ path: string; queueFollowUp: () => void }> {
+  const prevConfig = params.snapshot.config;
   await replaceConfigFile({
     nextConfig: params.nextConfig,
     writeOptions: params.writeOptions,
@@ -179,6 +197,11 @@ export async function commitGatewayConfigWrite(params: {
     queueFollowUp: () => {
       queueSharedGatewayAuthGenerationRefresh(true, params.nextConfig, params.context);
       queueSharedGatewayAuthDisconnect(Boolean(params.disconnectSharedAuthClients), params.context);
+      queueTrustedProxyAuthFollowUp({
+        prevConfig,
+        nextConfig: params.nextConfig,
+        context: params.context,
+      });
     },
   };
 }

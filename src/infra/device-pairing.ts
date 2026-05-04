@@ -912,6 +912,7 @@ export async function ensureDeviceToken(params: {
   deviceId: string;
   role: string;
   scopes: string[];
+  expectedPublicKey: string;
   baseDir?: string;
 }): Promise<DeviceAuthToken | null> {
   return await withLock(async () => {
@@ -926,6 +927,12 @@ export async function ensureDeviceToken(params: {
       return null;
     }
     const { device, role, tokens, existing } = context;
+    // Sink-local mutation ownership: reject attacker-keypair callers before the
+    // empty-scope reuse path below. Mirrors the connect-time
+    // pairingStateAllowsRequestedAccess invariant.
+    if (device.publicKey !== params.expectedPublicKey) {
+      return null;
+    }
     const approvedScopes = resolveApprovedDeviceScopeBaseline(device);
     if (
       !scopesWithinApprovedDeviceBaseline({
