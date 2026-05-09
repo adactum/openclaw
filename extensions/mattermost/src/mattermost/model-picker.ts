@@ -11,6 +11,18 @@ import {
 import type { MattermostInteractiveButtonInput } from "./interactions.js";
 
 const MATTERMOST_MODEL_PICKER_CONTEXT_KEY = "oc_model_picker";
+
+/**
+ * Returns true when the (already HMAC-verified) signed context tags itself as a
+ * model-picker context. Used by the production button-click authorizer to allow
+ * picker callbacks through the channel-type policy gates that otherwise deny
+ * generic button clicks (e.g. DM buttons whose clicker cannot be authenticated).
+ */
+export function isMattermostModelPickerContext(
+  context: Record<string, unknown> | null | undefined,
+): boolean {
+  return Boolean(context && context[MATTERMOST_MODEL_PICKER_CONTEXT_KEY] === true);
+}
 const MODELS_PAGE_SIZE = 8;
 const ACTION_IDS = {
   providers: "mdlprov",
