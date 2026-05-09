@@ -1,6 +1,7 @@
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import type { MattermostChannel } from "./client.js";
+import { parseMattermostModelPickerContext } from "./model-picker.js";
 import type { OpenClawConfig } from "./runtime-api.js";
 import {
   evaluateSenderGroupAccessForPolicy,
@@ -313,4 +314,77 @@ export function authorizeMattermostCommandInvocation(params: {
     channelDisplay,
     roomLabel,
   };
+}
+
+export type ButtonClickChannelAuthResult = { ok: true } | { ok: false; ephemeralText: string };
+
+/**
+ * Authorize a button-click interaction based on channel-type policy only.
+ *
+ * payload.user_id/user_name are non-authoritative for button clicks (Mattermost does not
+ * HMAC-bind the clicker), so user-identity allowlist checks are intentionally omitted.
+ * The pre-resolved groupPolicy from the monitor startup is passed in directly.
+ *
+ * This guard does NOT check allowTextCommands — button callbacks can originate from
+ * native slash commands (e.g. /models) that remain active even when commands.text=false.
+ * Command-execution gating is handled downstream by the picker/dispatch paths.
+ *
+ * When `context` is parseable as picker state (HMAC-verified ownerUserId + valid
+ * action), the click is allowed in DMs because picker actions remain safe (owner
+ * identity is HMAC-sealed). When `context` is not parseable as picker state, DMs
+ * are denied — even an HMAC-valid context tagged `oc_model_picker:true` but missing
+ * `ownerUserId`/valid `action` would otherwise reach the generic tail and would still
+ * acknowledge a button action without a corresponding agent action: the post update
+ * marks the button selected and a trusted system event records the click; neither
+ * carries claimed identity, but together they create false agent-progress signal.
+ *
+ * Classification at this boundary uses the full parser, not a shallow tag check.
+ */
+export function resolveButtonClickChannelAuthorization(params: {
+  channelInfo: MattermostChannel | null;
+  account: ResolvedMattermostAccount;
+  groupPolicy: string;
+  context: Record<string, unknown>;
+}): ButtonClickChannelAuthResult {
+  const { channelInfo, account, groupPolicy, context } = params;
+  const isPickerContext = parseMattermostModelPickerContext(context) !== null;
+
+  if (!channelInfo) {
+    return { ok: false, ephemeralText: "OpenClaw ignored this action." };
+  }
+
+  const channelType = channelInfo.type?.trim().toUpperCase();
+  const isDirect = channelType === "D";
+
+  if (isDirect) {
+    if (account.config.dmPolicy === "disabled") {
+      return { ok: false, ephemeralText: "OpenClaw ignored this action." };
+    }
+    if (!isPickerContext) {
+      return {
+        ok: false,
+        ephemeralText: "Button clicks aren't supported in direct messages.",
+      };
+    }
+    return { ok: true };
+  }
+
+  // Group / public channel: deny only when the channel-type policy globally disables
+  // interactions or when no allowlist is configured at all (policy not yet set up).
+  // Do not check user identity — the clicker cannot be verified from the callback payload.
+  if (groupPolicy === "disabled") {
+    return { ok: false, ephemeralText: "OpenClaw ignored this action." };
+  }
+
+  if (groupPolicy === "allowlist") {
+    const configGroupAllowFrom = normalizeMattermostAllowList(account.config.groupAllowFrom ?? []);
+    const configAllowFrom = normalizeMattermostAllowList(account.config.allowFrom ?? []);
+    const effectiveGroupAllowFrom =
+      configGroupAllowFrom.length > 0 ? configGroupAllowFrom : configAllowFrom;
+    if (effectiveGroupAllowFrom.length === 0) {
+      return { ok: false, ephemeralText: "OpenClaw ignored this action." };
+    }
+  }
+
+  return { ok: true };
 }

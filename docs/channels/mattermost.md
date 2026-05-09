@@ -351,7 +351,7 @@ When a user clicks a button:
 
 <Steps>
   <Step title="Buttons replaced with confirmation">
-    All buttons are replaced with a confirmation line (e.g., "✓ **Yes** selected by @user").
+    All buttons are replaced with a confirmation line (e.g., "✓ **Yes** selected").
   </Step>
   <Step title="Agent receives the selection">
     The agent receives the selection as an inbound message and responds.
@@ -400,6 +400,10 @@ External scripts and webhooks can post buttons directly via the Mattermost REST 
               context: {
                 action_id: "mybutton01", // must match button id (for name lookup)
                 action: "approve",
+                // Optional but recommended when the posting channel is known: include
+                // the channel id so the gateway rejects callbacks delivered to a
+                // different channel than the one the button was posted in.
+                __openclaw_channel_id: "<channel_id>",
                 // ... any custom fields ...
                 _token: "<hmac>", // see HMAC section below
               },
@@ -429,8 +433,11 @@ External scripts and webhooks can post buttons directly via the Mattermost REST 
 The gateway verifies button clicks with HMAC-SHA256. External scripts must generate tokens that match the gateway's verification logic:
 
 <Steps>
-  <Step title="Derive the secret from the bot token">
-    `HMAC-SHA256(key="openclaw-mattermost-interactions", data=botToken)`
+  <Step title="Derive the secret from the account ID and bot token">
+    `HMAC-SHA256(key="openclaw-mattermost-interactions", data=accountId + "\0" + botToken)`
+
+    The secret is domain-separated by account ID so two accounts sharing the same bot token produce independent tokens. `accountId` is the key under `channels.mattermost.accounts` (or `"default"` for the unnamed account). The `\0` is a literal null byte separator.
+
   </Step>
   <Step title="Build the context object">
     Build the context object with all fields **except** `_token`.
@@ -451,12 +458,23 @@ Python example:
 ```python
 import hmac, hashlib, json
 
+account_id = "default"  # or the explicit account key from config
+channel_id = "<channel_id>"  # the Mattermost channel id where the button was posted
 secret = hmac.new(
     b"openclaw-mattermost-interactions",
-    bot_token.encode(), hashlib.sha256
+    (account_id + "\x00" + bot_token).encode(), hashlib.sha256
 ).hexdigest()
 
-ctx = {"action_id": "mybutton01", "action": "approve"}
+# Recommended: include the posting channel id so the gateway rejects callbacks
+# delivered to a different channel than where the button was posted. The handler
+# rejects with HTTP 403 when this field is present and does not match
+# payload.channel_id; when absent, the handler accepts (compatibility-preserving
+# for raw integrations that don't know the channel at sign time).
+ctx = {
+    "action_id": "mybutton01",
+    "action": "approve",
+    "__openclaw_channel_id": channel_id,  # omit if not known at sign time
+}
 payload = json.dumps(ctx, sort_keys=True, separators=(",", ":"))
 token = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
@@ -468,7 +486,7 @@ context = {**ctx, "_token": token}
     - Python's `json.dumps` adds spaces by default (`{"key": "val"}`). Use `separators=(",", ":")` to match JavaScript's compact output (`{"key":"val"}`).
     - Always sign **all** context fields (minus `_token`). The gateway strips `_token` then signs everything remaining. Signing a subset causes silent verification failure.
     - Use `sort_keys=True` - the gateway sorts keys before signing, and Mattermost may reorder context fields when storing the payload.
-    - Derive the secret from the bot token (deterministic), not random bytes. The secret must be the same across the process that creates buttons and the gateway that verifies.
+    - Derive the secret from `accountId + "\0" + botToken` (deterministic, account-scoped), not random bytes. The secret must be the same across the process that creates buttons and the gateway that verifies, and is unique per account so two accounts sharing a bot token produce independent tokens.
 
   </Accordion>
 </AccordionGroup>

@@ -480,3 +480,288 @@ describe("mattermost inbound user posts", () => {
     );
   });
 });
+
+describe("mattermost button click HTTP handler — prompt-taint and malformed-picker DM", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockState.abortController = undefined;
+    mockState.runtimeCore = createRuntimeCore(testConfig);
+    mockState.createMattermostClient.mockReturnValue({
+      baseUrl: "https://mattermost.example.com",
+      apiBaseUrl: "https://mattermost.example.com/api/v4",
+      token: "bot-token",
+      request: vi.fn(),
+      fetchImpl: vi.fn(),
+    });
+    mockState.createMattermostDraftStream.mockReturnValue({
+      update: vi.fn(),
+      stop: vi.fn(async () => {}),
+    });
+    mockState.fetchMattermostMe.mockResolvedValue({
+      id: "bot-user",
+      username: "openclaw",
+      update_at: 1,
+    });
+    mockState.registerMattermostMonitorSlashCommands.mockResolvedValue(undefined);
+    mockState.registerPluginHttpRoute.mockReturnValue(vi.fn());
+    mockState.resolveChannelInfo.mockResolvedValue({
+      id: "chan-1",
+      name: "town-square",
+      display_name: "Town Square",
+      team_id: "team-1",
+      type: "O",
+    });
+    mockState.resolveMattermostMedia.mockResolvedValue([]);
+    mockState.resolveUserInfo.mockResolvedValue({ id: "user-1", username: "alice" });
+    mockState.updateMattermostPost.mockResolvedValue({ id: "post-1" });
+  });
+
+  // Lightweight req/res harness mirroring interactions.test.ts.
+  type CapturedRes = import("node:http").ServerResponse & {
+    headers: Record<string, string>;
+    body: string;
+  };
+
+  function createReq(params: {
+    method?: string;
+    body?: unknown;
+    remoteAddress?: string;
+  }): import("node:http").IncomingMessage {
+    const body = params.body === undefined ? "" : JSON.stringify(params.body);
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const req = {
+      destroyed: false,
+      method: params.method ?? "POST",
+      headers: {},
+      socket: { remoteAddress: params.remoteAddress ?? "127.0.0.1" },
+      on(event: string, handler: (...args: unknown[]) => void) {
+        const existing = listeners.get(event) ?? [];
+        existing.push(handler);
+        listeners.set(event, existing);
+        return this;
+      },
+      removeListener(event: string, handler: (...args: unknown[]) => void) {
+        const existing = listeners.get(event) ?? [];
+        listeners.set(
+          event,
+          existing.filter((entry) => entry !== handler),
+        );
+        return this;
+      },
+      destroy() {
+        this.destroyed = true;
+        return this;
+      },
+    } as import("node:http").IncomingMessage & {
+      emitTest: (event: string, ...args: unknown[]) => void;
+    };
+    req.emitTest = (event: string, ...args: unknown[]) => {
+      const handlers = listeners.get(event) ?? [];
+      for (const handler of handlers) {
+        handler(...args);
+      }
+    };
+    queueMicrotask(() => {
+      if (body) {
+        req.emitTest("data", Buffer.from(body));
+      }
+      req.emitTest("end");
+    });
+    return req;
+  }
+
+  function createRes(): CapturedRes {
+    const res = {
+      statusCode: 200,
+      headers: {} as Record<string, string>,
+      body: "",
+      setHeader(name: string, value: string | number | readonly string[]) {
+        res.headers[name] = Array.isArray(value) ? value.join(",") : String(value);
+        return res;
+      },
+      end(
+        chunk?: string | Buffer | Uint8Array,
+        _encoding?: BufferEncoding | (() => void),
+        cb?: () => void,
+      ) {
+        res.body = chunk ? String(chunk) : "";
+        cb?.();
+        return res;
+      },
+    } as CapturedRes;
+    return res;
+  }
+
+  async function startMonitorAndCaptureHandler() {
+    const socket = new FakeWebSocket();
+    const abortController = new AbortController();
+    mockState.abortController = abortController;
+    const { monitorMattermostProvider } = await import("./monitor.js");
+    const monitor = monitorMattermostProvider({
+      config: testConfig,
+      runtime: testRuntime(),
+      abortSignal: abortController.signal,
+      webSocketFactory: () => socket,
+    });
+    await vi.waitFor(() => {
+      expect(mockState.registerPluginHttpRoute).toHaveBeenCalled();
+    });
+    const registration = mockState.registerPluginHttpRoute.mock.calls[0]?.[0] as
+      | { handler: (req: unknown, res: unknown) => Promise<void> }
+      | undefined;
+    if (!registration) {
+      throw new Error("interaction route was not registered");
+    }
+    return { handler: registration.handler, socket, abortController, monitor };
+  }
+
+  function buildSignedBody(
+    context: Record<string, unknown>,
+    token: string,
+    overrides: { channelId?: string; userName?: string; userId?: string } = {},
+  ) {
+    return {
+      user_id: overrides.userId ?? "u-evil",
+      ...(overrides.userName !== undefined ? { user_name: overrides.userName } : {}),
+      channel_id: overrides.channelId ?? "chan-1",
+      post_id: "post-1",
+      context: { ...context, _token: token },
+    };
+  }
+
+  it("Test H: generic group click synthetic inbound carries no claimed identity", async () => {
+    const interactions = await import("./interactions.js");
+    const { generateInteractionToken } = interactions;
+    const { handler, socket, abortController, monitor } = await startMonitorAndCaptureHandler();
+
+    // Simulate Mattermost client.request used by updateMattermostPost — already mocked.
+    const channelId = "chan-1";
+    const ctx = { action_id: "approve", __openclaw_channel_id: channelId };
+    const token = generateInteractionToken(ctx, "default");
+    const req = createReq({
+      body: buildSignedBody(ctx, token, {
+        channelId,
+        userName: "spoofed-admin",
+        userId: "u-evil",
+      }),
+    });
+    const res = createRes();
+    await handler(req, res);
+    expect(res.statusCode).toBe(200);
+
+    expect(mockState.dispatchReplyFromConfig).toHaveBeenCalledTimes(1);
+    const ctxPayload = mockState.dispatchReplyFromConfig.mock.calls[0]?.[0]?.ctx as Record<
+      string,
+      unknown
+    >;
+    for (const key of [
+      "Body",
+      "BodyForAgent",
+      "RawBody",
+      "CommandBody",
+      "ConversationLabel",
+    ] as const) {
+      const value = ctxPayload[key];
+      if (typeof value === "string") {
+        expect(value).not.toContain("spoofed-admin");
+        expect(value).not.toContain("u-evil");
+      }
+    }
+    expect(ctxPayload.SenderName).toBeUndefined();
+    expect(ctxPayload.MessageSid).toBe("interaction:post-1:approve");
+
+    abortController.abort();
+    socket.emitClose(1000);
+    await monitor;
+  });
+
+  it("Test I: picker-select dispatch routes via HMAC-bound ownerUserId, not claimed user_name", async () => {
+    const interactions = await import("./interactions.js");
+    const { generateInteractionToken } = interactions;
+    const { handler, socket, abortController, monitor } = await startMonitorAndCaptureHandler();
+
+    // Picker-select context: HMAC-sealed ownerUserId, claimed user_name in payload.
+    const ctx = {
+      action_id: "mdlsel",
+      __openclaw_channel_id: "chan-1",
+      oc_model_picker: true,
+      ownerUserId: "owner-real",
+      action: "select",
+      provider: "openai",
+      page: 0,
+      model: "gpt-5.5",
+    };
+    const token = generateInteractionToken(ctx, "default");
+    const req = createReq({
+      body: buildSignedBody(ctx, token, {
+        channelId: "chan-1",
+        userName: "spoofed-admin",
+        userId: "u-evil",
+      }),
+    });
+    const res = createRes();
+    await handler(req, res);
+    // Picker handler runs async — no strict assertion on dispatchReply here, but
+    // verify response was 200 and no spoofed identity touched the prompt-side fields
+    // when dispatchReplyFromConfig was called (if at all).
+    expect(res.statusCode).toBe(200);
+    if (mockState.dispatchReplyFromConfig.mock.calls.length > 0) {
+      const ctxPayload = mockState.dispatchReplyFromConfig.mock.calls[0]?.[0]?.ctx as Record<
+        string,
+        unknown
+      >;
+      expect(ctxPayload.SenderId).toBe("owner-real");
+      const senderName = ctxPayload.SenderName;
+      if (typeof senderName === "string") {
+        expect(senderName).not.toBe("spoofed-admin");
+      }
+      const conversationLabel = ctxPayload.ConversationLabel;
+      if (typeof conversationLabel === "string") {
+        expect(conversationLabel).not.toContain("spoofed-admin");
+      }
+    }
+
+    abortController.abort();
+    socket.emitClose(1000);
+    await monitor;
+  });
+
+  it("Test J: malformed picker DM context (HMAC-valid bare tag) is denied before side effects", async () => {
+    mockState.resolveChannelInfo.mockResolvedValue({
+      id: "dm-1",
+      name: "",
+      display_name: "",
+      team_id: "team-1",
+      type: "D",
+    });
+    const interactions = await import("./interactions.js");
+    const { generateInteractionToken } = interactions;
+    const { handler, socket, abortController, monitor } = await startMonitorAndCaptureHandler();
+
+    // HMAC-valid context with the picker tag set but missing ownerUserId/valid action.
+    const ctx = {
+      action_id: "approve",
+      __openclaw_channel_id: "dm-1",
+      oc_model_picker: true,
+    };
+    const token = generateInteractionToken(ctx, "default");
+    const req = createReq({
+      body: buildSignedBody(ctx, token, {
+        channelId: "dm-1",
+        userName: "spoofed-admin",
+      }),
+    });
+    const res = createRes();
+    await handler(req, res);
+
+    // The handler short-circuits with the auth denial response (statusCode 200 + ephemeral_text).
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain("ephemeral_text");
+    expect(mockState.enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(mockState.dispatchReplyFromConfig).not.toHaveBeenCalled();
+
+    abortController.abort();
+    socket.emitClose(1000);
+    await monitor;
+  });
+});

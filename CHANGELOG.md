@@ -200,6 +200,7 @@ Docs: https://docs.openclaw.ai
 
 ### Fixes
 
+- Mattermost: harden interactive-button HMAC against cross-account secret reuse (`HMAC-SHA256(key="openclaw-mattermost-interactions", data=accountId + "\0" + botToken)`), fail-closed source-IP and empty-secret comparisons, classify model-picker contexts with the full parser at the auth boundary, and stop trusting Mattermost-claimed clicker identity for routing, authorization, prompt context, and channel-visible completion text. External signers must update to the account-scoped formula per `docs/channels/mattermost.md`.
 - Discord: preserve username target resolution for Discord outbound sends. (#79076) Thanks @vincentkoc.
 - Gateway/sessions: rotate generated transcript paths when gateway sessions reset, complementing the daily-rollover transcript persistence. (#79076) Thanks @vincentkoc.
 - Dependencies: pin the transitive `fast-uri` production dependency to `3.1.2` so the production dependency audit no longer resolves the vulnerable `<=3.1.1` range. Thanks @shakkernerd.

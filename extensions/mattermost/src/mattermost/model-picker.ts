@@ -11,6 +11,7 @@ import {
 import type { MattermostInteractiveButtonInput } from "./interactions.js";
 
 const MATTERMOST_MODEL_PICKER_CONTEXT_KEY = "oc_model_picker";
+
 const MODELS_PAGE_SIZE = 8;
 const ACTION_IDS = {
   providers: "mdlprov",

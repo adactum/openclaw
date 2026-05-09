@@ -187,3 +187,212 @@ describe("mattermost monitor auth", () => {
     });
   });
 });
+
+describe("resolveButtonClickChannelAuthorization", () => {
+  // resolveButtonClickChannelAuthorization does not use runtime-api.js; import directly.
+  let resolveButtonClickChannelAuthorization: typeof import("./monitor-auth.js").resolveButtonClickChannelAuthorization;
+
+  beforeAll(async () => {
+    ({ resolveButtonClickChannelAuthorization } = await import("./monitor-auth.js"));
+  });
+
+  const baseAccount = {
+    accountId: "default",
+    enabled: true,
+    botToken: "bot-token",
+    baseUrl: "https://chat.example.com",
+    botTokenSource: "config",
+    baseUrlSource: "config",
+    streamingMode: "partial",
+    config: {},
+  } as never;
+
+  const channelInfo = {
+    id: "chan-1",
+    type: "O",
+    name: "general",
+    display_name: "General",
+  } as never;
+  const dmChannelInfo = { id: "dm-1", type: "D", name: "", display_name: "" } as never;
+
+  it("allows a public channel when groupPolicy is open", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: baseAccount,
+        groupPolicy: "open",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("allows a public channel when groupPolicy is allowlist and entries are configured", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: { ...baseAccount, config: { allowFrom: ["trusted-user"] } } as never,
+        groupPolicy: "allowlist",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("denies a public channel when groupPolicy is disabled", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: baseAccount,
+        groupPolicy: "disabled",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("denies a public channel when groupPolicy is allowlist with no entries configured", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: baseAccount,
+        groupPolicy: "allowlist",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("allows a picker DM click when dmPolicy is pairing", () => {
+    // Picker contexts carry an HMAC-sealed owner identity, so DM picker clicks are
+    // allowed even though the clicker is not authenticated.
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo: dmChannelInfo,
+        account: { ...baseAccount, config: { dmPolicy: "pairing" } } as never,
+        groupPolicy: "allowlist",
+        context: { oc_model_picker: true, ownerUserId: "u-1", action: "providers" } as Record<
+          string,
+          unknown
+        >,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("denies a non-picker DM click even when dmPolicy permits DMs", () => {
+    // Generic (non-picker) button clicks in DMs are denied because the clicker
+    // cannot be authenticated and dispatch is skipped downstream — proceeding
+    // would write a trusted system event and post update with no agent action
+    // (a silent false-success).
+    const result = resolveButtonClickChannelAuthorization({
+      channelInfo: dmChannelInfo,
+      account: { ...baseAccount, config: { dmPolicy: "pairing" } } as never,
+      groupPolicy: "allowlist",
+      context: {} as Record<string, unknown>,
+    });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.ephemeralText).toMatch(/direct message/i);
+    }
+  });
+
+  it("denies any DM click (picker or not) when dmPolicy is disabled", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo: dmChannelInfo,
+        account: { ...baseAccount, config: { dmPolicy: "disabled" } } as never,
+        groupPolicy: "open",
+        context: { oc_model_picker: true, ownerUserId: "u-1", action: "providers" } as Record<
+          string,
+          unknown
+        >,
+      }),
+    ).toMatchObject({ ok: false });
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo: dmChannelInfo,
+        account: { ...baseAccount, config: { dmPolicy: "disabled" } } as never,
+        groupPolicy: "open",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("allows button clicks even when text commands are disabled (native slash-command picker flows)", () => {
+    // Button callbacks can originate from native slash commands (e.g. /models) that remain
+    // active even when commands.text=false. The guard must not block these.
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: { ...baseAccount, config: { allowFrom: ["trusted-user"] } } as never,
+        groupPolicy: "open",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("denies when channelInfo is null (unknown channel type)", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo: null,
+        account: baseAccount,
+        groupPolicy: "open",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  it("uses groupAllowFrom when configured instead of allowFrom", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: {
+          ...baseAccount,
+          config: { groupAllowFrom: ["group-member"], allowFrom: [] },
+        } as never,
+        groupPolicy: "allowlist",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toEqual({ ok: true });
+  });
+  // ── Full-parser classification (Tests E–G) ──────────────────────────
+
+  it("denies a malformed signed picker DM (tag set, ownerUserId missing)", () => {
+    // Even an HMAC-valid context tagged oc_model_picker:true is denied at the auth
+    // boundary when it does not parse as picker state (no ownerUserId / no valid action).
+    const malformed = { action_id: "approve", oc_model_picker: true } as Record<string, unknown>;
+    const result = resolveButtonClickChannelAuthorization({
+      channelInfo: dmChannelInfo,
+      account: { ...baseAccount, config: { dmPolicy: "pairing" } } as never,
+      groupPolicy: "open",
+      context: malformed,
+    });
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.ephemeralText).toMatch(/direct message/i);
+    }
+  });
+
+  it("allows a valid picker DM (parseable picker state with ownerUserId + valid action)", () => {
+    const valid = {
+      ownerUserId: "u-1",
+      action: "providers",
+      oc_model_picker: true,
+    } as Record<string, unknown>;
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo: dmChannelInfo,
+        account: { ...baseAccount, config: { dmPolicy: "pairing" } } as never,
+        groupPolicy: "open",
+        context: valid,
+      }),
+    ).toEqual({ ok: true });
+  });
+
+  it("allows a generic public-channel click (compat: channel-policy gate still passes)", () => {
+    expect(
+      resolveButtonClickChannelAuthorization({
+        channelInfo,
+        account: { ...baseAccount, config: { allowFrom: ["trusted-user"] } } as never,
+        groupPolicy: "allowlist",
+        context: {} as Record<string, unknown>,
+      }),
+    ).toEqual({ ok: true });
+  });
+});

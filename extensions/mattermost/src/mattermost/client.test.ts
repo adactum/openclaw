@@ -297,7 +297,7 @@ describe("updateMattermostPost", () => {
     const { body } = await updatePostAndCapture({
       message: "Original message",
       props: {
-        attachments: [{ text: "✓ **do_now** selected by @tony" }],
+        attachments: [{ text: "✓ **do_now** selected" }],
       },
     });
     expect(body.message).toBe("Original message");
