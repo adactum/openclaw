@@ -429,8 +429,10 @@ External scripts and webhooks can post buttons directly via the Mattermost REST 
 The gateway verifies button clicks with HMAC-SHA256. External scripts must generate tokens that match the gateway's verification logic:
 
 <Steps>
-  <Step title="Derive the secret from the bot token">
-    `HMAC-SHA256(key="openclaw-mattermost-interactions", data=botToken)`
+  <Step title="Derive the secret from the account ID and bot token">
+    `HMAC-SHA256(key="openclaw-mattermost-interactions", data=accountId + "\0" + botToken)`
+
+    The secret is domain-separated by account ID so two accounts sharing the same bot token produce independent tokens. `accountId` is the key under `channels.mattermost.accounts` (or `"default"` for the unnamed account). The `\0` is a literal null byte separator.
   </Step>
   <Step title="Build the context object">
     Build the context object with all fields **except** `_token`.
@@ -451,9 +453,10 @@ Python example:
 ```python
 import hmac, hashlib, json
 
+account_id = "default"  # or the explicit account key from config
 secret = hmac.new(
     b"openclaw-mattermost-interactions",
-    bot_token.encode(), hashlib.sha256
+    (account_id + "\x00" + bot_token).encode(), hashlib.sha256
 ).hexdigest()
 
 ctx = {"action_id": "mybutton01", "action": "approve"}

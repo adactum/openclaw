@@ -48,6 +48,7 @@ import {
   isMattermostSenderAllowed,
   normalizeMattermostAllowEntry,
   normalizeMattermostAllowList,
+  resolveButtonClickChannelAuthorization,
 } from "./monitor-auth.js";
 import {
   evaluateMattermostMentionGate,
@@ -591,31 +592,15 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       allowRealIpFallback: cfg.gateway?.allowRealIpFallback === true,
       handleInteraction: handleModelPickerInteraction,
       authorizeButtonClick: async ({ payload, post }) => {
+        // payload.user_id / payload.user_name are non-authoritative (Mattermost does not
+        // HMAC-bind the clicker). Authorize on channel-type policy only — no user identity.
         const channelInfo = await resolveChannelInfo(payload.channel_id);
-        const isDirect = channelInfo?.type?.trim().toUpperCase() === "D";
-        const allowTextCommands = core.channel.commands.shouldHandleTextCommands({
-          cfg,
-          surface: "mattermost",
-        });
-        const decision = authorizeMattermostCommandInvocation({
-          account,
-          cfg,
-          senderId: payload.user_id,
-          senderName: payload.user_name ?? "",
-          channelId: payload.channel_id,
+        const result = resolveButtonClickChannelAuthorization({
           channelInfo,
-          storeAllowFrom: isDirect
-            ? await readStoreAllowFromForDmPolicy({
-                provider: "mattermost",
-                accountId: account.accountId,
-                dmPolicy: account.config.dmPolicy ?? "pairing",
-                readStore: pairing.readStoreForDmPolicy,
-              })
-            : undefined,
-          allowTextCommands,
-          hasControlCommand: false,
+          account,
+          groupPolicy,
         });
-        if (decision.ok) {
+        if (result.ok) {
           return { ok: true };
         }
         return {
@@ -625,14 +610,16 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
               message: post.message ?? "",
               props: post.props ?? undefined,
             },
-            ephemeral_text: `OpenClaw ignored this action for ${decision.roomLabel}.`,
+            ephemeral_text: result.ephemeralText,
           },
         };
       },
-      resolveSessionKey: async ({ channelId, userId, post }) => {
+      resolveSessionKey: async ({ channelId, post }) => {
         const channelInfo = await resolveChannelInfo(channelId);
         const kind = mapMattermostChannelTypeToChatType(channelInfo?.type);
         const teamId = channelInfo?.team_id ?? undefined;
+        // No trusted per-user identity is available for button interactions, so direct-channel
+        // routing falls back to the HMAC-signed channel id rather than a spoofable user id.
         const route = core.channel.routing.resolveAgentRoute({
           cfg,
           channel: "mattermost",
@@ -640,7 +627,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
           teamId,
           peer: {
             kind,
-            id: kind === "direct" ? userId : channelId,
+            id: channelId,
           },
         });
         const replyToMode = resolveMattermostReplyToMode(account, kind);
@@ -655,6 +642,12 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       dispatchButtonClick: async (opts) => {
         const channelInfo = await resolveChannelInfo(opts.channelId);
         const kind = mapMattermostChannelTypeToChatType(channelInfo?.type);
+        // Mattermost does not HMAC-bind the clicker's identity, so we have no trusted per-user
+        // identity to route a synthetic inbound for direct-message channels. Skip dispatch
+        // rather than route to a spoofable peer id.
+        if (kind === "direct") {
+          return;
+        }
         const chatType = channelChatType(kind);
         const teamId = channelInfo?.team_id ?? undefined;
         const channelName = channelInfo?.name ?? undefined;
@@ -666,7 +659,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
           teamId,
           peer: {
             kind,
-            id: kind === "direct" ? opts.userId : opts.channelId,
+            id: opts.channelId,
           },
         });
         const replyToMode = resolveMattermostReplyToMode(account, kind);
@@ -677,30 +670,27 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
           replyToMode,
           threadRootId: opts.post.root_id,
         });
-        const to = kind === "direct" ? `user:${opts.userId}` : `channel:${opts.channelId}`;
-        const bodyText = `[Button click: user @${opts.userName} selected "${opts.actionName}"]`;
+        const to = `channel:${opts.channelId}`;
+        const bodyText = `[Button click: user @${opts.claimedUserName} selected "${opts.actionName}"]`;
         const ctxPayload = core.channel.reply.finalizeInboundContext({
           Body: bodyText,
           BodyForAgent: bodyText,
           RawBody: bodyText,
           CommandBody: bodyText,
           From:
-            kind === "direct"
-              ? `mattermost:${opts.userId}`
-              : kind === "group"
-                ? `mattermost:group:${opts.channelId}`
-                : `mattermost:channel:${opts.channelId}`,
+            kind === "group"
+              ? `mattermost:group:${opts.channelId}`
+              : `mattermost:channel:${opts.channelId}`,
           To: to,
           SessionKey: threadContext.sessionKey,
           ParentSessionKey: threadContext.parentSessionKey,
           AccountId: route.accountId,
           ChatType: chatType,
-          ConversationLabel: `mattermost:${opts.userName}`,
-          GroupSubject: kind !== "direct" ? channelDisplay : undefined,
+          ConversationLabel: `mattermost:${opts.claimedUserName}`,
+          GroupSubject: channelDisplay,
           GroupChannel: channelName ? `#${channelName}` : undefined,
           GroupSpace: teamId,
-          SenderName: opts.userName,
-          SenderId: opts.userId,
+          SenderName: opts.claimedUserName,
           Provider: "mattermost" as const,
           Surface: "mattermost" as const,
           MessageSid: `interaction:${opts.postId}:${opts.actionId}`,
@@ -1018,12 +1008,6 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       return null;
     }
 
-    if (pickerState.ownerUserId !== params.payload.user_id) {
-      return {
-        ephemeral_text: "Only the person who opened this picker can use it.",
-      };
-    }
-
     const channelInfo = await resolveChannelInfo(params.payload.channel_id);
     const pickerCommandText =
       pickerState.action === "select"
@@ -1048,8 +1032,8 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
     const auth = authorizeMattermostCommandInvocation({
       account,
       cfg,
-      senderId: params.payload.user_id,
-      senderName: params.userName,
+      senderId: pickerState.ownerUserId,
+      senderName: "",
       channelId: params.payload.channel_id,
       channelInfo,
       storeAllowFrom,
@@ -1059,13 +1043,15 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
     if (!auth.ok) {
       if (auth.denyReason === "dm-pairing") {
         const { code } = await pairing.upsertPairingRequest({
-          id: params.payload.user_id,
+          id: pickerState.ownerUserId,
           meta: { name: params.userName },
         });
+        // payload.user_id is the claimed (non-authoritative) display id only.
+        const claimedUserId = params.payload.user_id;
         return {
           ephemeral_text: core.channel.pairing.buildPairingReply({
             channel: "mattermost",
-            idLine: `Your Mattermost user id: ${params.payload.user_id}`,
+            idLine: `Your Mattermost user id: ${claimedUserId}`,
             code,
           }),
         };
@@ -1097,7 +1083,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
       teamId,
       peer: {
         kind,
-        id: kind === "direct" ? params.payload.user_id : params.payload.channel_id,
+        id: kind === "direct" ? pickerState.ownerUserId : params.payload.channel_id,
       },
     });
     const replyToMode = resolveMattermostReplyToMode(account, kind);
@@ -1178,7 +1164,7 @@ export async function monitorMattermostProvider(opts: MonitorMattermostOpts = {}
           sessionKey: threadContext.sessionKey,
           parentSessionKey: threadContext.parentSessionKey,
           channelId: params.payload.channel_id,
-          senderId: params.payload.user_id,
+          senderId: pickerState.ownerUserId,
           senderName: params.userName,
           kind,
           chatType,

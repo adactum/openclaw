@@ -107,7 +107,7 @@ function isAllowedInteractionSource(params: {
 }): boolean {
   const { allowedSourceIps } = params;
   if (!allowedSourceIps?.length) {
-    return true;
+    return false;
   }
 
   const clientIp = resolveClientIp({
@@ -171,38 +171,28 @@ export function resolveInteractionCallbackUrl(
 // Secret is derived from the bot token so it's stable across CLI and gateway processes.
 
 const interactionSecrets = new Map<string, string>();
-let defaultInteractionSecret: string | undefined;
 
-function deriveInteractionSecret(botToken: string): string {
-  return createHmac("sha256", "openclaw-mattermost-interactions").update(botToken).digest("hex");
+function deriveInteractionSecret(botToken: string, accountId: string): string {
+  // Include accountId so two accounts sharing the same bot token produce different secrets,
+  // preventing cross-account token reuse.
+  return createHmac("sha256", "openclaw-mattermost-interactions")
+    .update(accountId)
+    .update("\x00")
+    .update(botToken)
+    .digest("hex");
 }
 
-export function setInteractionSecret(accountIdOrBotToken: string, botToken?: string): void {
-  if (typeof botToken === "string") {
-    interactionSecrets.set(accountIdOrBotToken, deriveInteractionSecret(botToken));
-    return;
-  }
-  // Backward-compatible fallback for call sites/tests that only pass botToken.
-  defaultInteractionSecret = deriveInteractionSecret(accountIdOrBotToken);
+export function setInteractionSecret(accountId: string, botToken: string): void {
+  interactionSecrets.set(accountId, deriveInteractionSecret(botToken, accountId));
 }
 
-export function getInteractionSecret(accountId?: string): string {
-  const scoped = accountId ? interactionSecrets.get(accountId) : undefined;
+export function getInteractionSecret(accountId: string): string {
+  const scoped = interactionSecrets.get(accountId);
   if (scoped) {
     return scoped;
   }
-  if (defaultInteractionSecret) {
-    return defaultInteractionSecret;
-  }
-  // Fallback for single-account runtimes that only registered scoped secrets.
-  if (interactionSecrets.size === 1) {
-    const first = interactionSecrets.values().next().value;
-    if (typeof first === "string") {
-      return first;
-    }
-  }
   throw new Error(
-    "Interaction secret not initialized — call setInteractionSecret(accountId, botToken) first",
+    `Interaction secret not initialized for account ${accountId} — call setInteractionSecret(accountId, botToken) first`,
   );
 }
 
@@ -222,7 +212,7 @@ function canonicalizeInteractionContext(value: unknown): unknown {
 
 export function generateInteractionToken(
   context: Record<string, unknown>,
-  accountId?: string,
+  accountId: string,
 ): string {
   const secret = getInteractionSecret(accountId);
   const payload = JSON.stringify(canonicalizeInteractionContext(context));
@@ -232,7 +222,7 @@ export function generateInteractionToken(
 export function verifyInteractionToken(
   context: Record<string, unknown>,
   token: string,
-  accountId?: string,
+  accountId: string,
 ): boolean {
   const expected = generateInteractionToken(context, accountId);
   return safeEqualSecret(expected, token);
@@ -276,7 +266,7 @@ function sanitizeActionId(id: string): string {
 
 export function buildButtonAttachments(params: {
   callbackUrl: string;
-  accountId?: string;
+  accountId: string;
   buttons: Array<{
     id: string;
     name: string;
@@ -317,7 +307,7 @@ export function buildButtonAttachments(params: {
 
 export function buildButtonProps(params: {
   callbackUrl: string;
-  accountId?: string;
+  accountId: string;
   channelId: string;
   buttons: Array<unknown>;
   text?: string;
@@ -373,11 +363,7 @@ export function createMattermostInteractionHandler(params: {
   allowedSourceIps?: string[];
   trustedProxies?: string[];
   allowRealIpFallback?: boolean;
-  resolveSessionKey?: (params: {
-    channelId: string;
-    userId: string;
-    post: MattermostPost;
-  }) => Promise<string>;
+  resolveSessionKey?: (params: { channelId: string; post: MattermostPost }) => Promise<string>;
   handleInteraction?: (opts: {
     payload: MattermostInteractionPayload;
     userName: string;
@@ -393,8 +379,7 @@ export function createMattermostInteractionHandler(params: {
   }) => Promise<MattermostInteractionAuthorizationResult>;
   dispatchButtonClick?: (opts: {
     channelId: string;
-    userId: string;
-    userName: string;
+    claimedUserName: string;
     actionId: string;
     actionName: string;
     postId: string;
@@ -464,7 +449,17 @@ export function createMattermostInteractionHandler(params: {
 
     // Strip _token before verification (it wasn't in the original context)
     const { _token, ...contextWithoutToken } = context;
-    if (!verifyInteractionToken(contextWithoutToken, token, accountId)) {
+    let tokenValid = false;
+    try {
+      tokenValid = verifyInteractionToken(contextWithoutToken, token, accountId);
+    } catch (err) {
+      log?.(`mattermost interaction: token verification failed: ${String(err)}`);
+      res.statusCode = 403;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "Invalid token" }));
+      return;
+    }
+    if (!tokenValid) {
       log?.("mattermost interaction: invalid _token");
       res.statusCode = 403;
       res.setHeader("Content-Type", "application/json");
@@ -494,7 +489,10 @@ export function createMattermostInteractionHandler(params: {
       return;
     }
 
-    const userName = payload.user_name ?? payload.user_id;
+    // payload.user_name and payload.user_id are claimed (non-authoritative) inbound values:
+    // Mattermost's interaction protocol does not HMAC-bind the clicker, so this name is
+    // suitable only for display/log labels — not for routing or trust decisions.
+    const claimedUserName = payload.user_name ?? payload.user_id;
     let originalMessage = "";
     let originalPost: MattermostPost | null = null;
     let clickedButtonName: string | null = null;
@@ -549,7 +547,7 @@ export function createMattermostInteractionHandler(params: {
     }
 
     log?.(
-      `mattermost interaction: action=${actionId} user=${payload.user_name ?? payload.user_id} ` +
+      `mattermost interaction: action=${actionId} claimedUser=${claimedUserName} ` +
         `post=${payload.post_id} channel=${payload.channel_id}`,
     );
 
@@ -584,7 +582,7 @@ export function createMattermostInteractionHandler(params: {
       try {
         const response = await params.handleInteraction({
           payload,
-          userName,
+          userName: claimedUserName,
           actionId,
           actionName: clickedButtonName,
           originalMessage,
@@ -612,13 +610,12 @@ export function createMattermostInteractionHandler(params: {
     try {
       const eventLabel =
         `Mattermost button click: action="${actionId}" ` +
-        `by ${payload.user_name ?? payload.user_id} ` +
+        `by ${claimedUserName} ` +
         `in channel ${payload.channel_id}`;
 
       const sessionKey = params.resolveSessionKey
         ? await params.resolveSessionKey({
             channelId: payload.channel_id,
-            userId: payload.user_id,
             post: originalPost,
           })
         : `agent:main:mattermost:${accountId}:${payload.channel_id}`;
@@ -638,7 +635,7 @@ export function createMattermostInteractionHandler(params: {
         props: {
           attachments: [
             {
-              text: `✓ **${clickedButtonName}** selected by @${userName}`,
+              text: `✓ **${clickedButtonName}** selected by @${claimedUserName}`,
             },
           ],
         },
@@ -657,8 +654,7 @@ export function createMattermostInteractionHandler(params: {
       try {
         await params.dispatchButtonClick({
           channelId: payload.channel_id,
-          userId: payload.user_id,
-          userName,
+          claimedUserName,
           actionId,
           actionName: clickedButtonName,
           postId: payload.post_id,
