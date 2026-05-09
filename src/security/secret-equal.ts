@@ -16,12 +16,12 @@ export function safeEqualSecret(
   if (typeof provided !== "string" || typeof expected !== "string") {
     return false;
   }
+  if (provided.length === 0 || expected.length === 0) {
+    return false;
+  }
   const providedBytes = Buffer.from(provided, "utf8");
   const expectedBytes = Buffer.from(expected, "utf8");
   const byteLength = Math.max(providedBytes.length, expectedBytes.length);
-  if (byteLength === 0) {
-    return true;
-  }
   return (
     timingSafeEqual(
       padSecretBytes(providedBytes, byteLength),

@@ -50,27 +50,36 @@ function requireAction(attachments: ButtonAttachments, index = 0): ButtonAction 
 
 describe("setInteractionSecret / getInteractionSecret", () => {
   beforeEach(() => {
-    setInteractionSecret("test-bot-token");
+    setInteractionSecret("acct", "test-bot-token");
   });
 
   it("derives a deterministic secret from the bot token", () => {
-    setInteractionSecret("token-a");
-    const secretA = getInteractionSecret();
-    setInteractionSecret("token-a");
-    const secretA2 = getInteractionSecret();
+    setInteractionSecret("acct", "token-a");
+    const secretA = getInteractionSecret("acct");
+    setInteractionSecret("acct", "token-a");
+    const secretA2 = getInteractionSecret("acct");
     expect(secretA).toBe(secretA2);
   });
 
   it("produces different secrets for different tokens", () => {
-    setInteractionSecret("token-a");
-    const secretA = getInteractionSecret();
-    setInteractionSecret("token-b");
-    const secretB = getInteractionSecret();
+    setInteractionSecret("acct", "token-a");
+    const secretA = getInteractionSecret("acct");
+    setInteractionSecret("acct", "token-b");
+    const secretB = getInteractionSecret("acct");
     expect(secretA).not.toBe(secretB);
   });
 
   it("returns a hex string", () => {
-    expect(getInteractionSecret()).toMatch(/^[0-9a-f]+$/);
+    expect(getInteractionSecret("acct")).toMatch(/^[0-9a-f]+$/);
+  });
+
+  it("throws when no scoped secret is registered for the account", () => {
+    expect(() => getInteractionSecret("never-registered")).toThrow();
+  });
+
+  it("does not fall back across accounts", () => {
+    setInteractionSecret("acct-a", "bot-a");
+    expect(() => getInteractionSecret("acct-b")).toThrow();
   });
 });
 
@@ -78,41 +87,41 @@ describe("setInteractionSecret / getInteractionSecret", () => {
 
 describe("generateInteractionToken / verifyInteractionToken", () => {
   beforeEach(() => {
-    setInteractionSecret("test-bot-token");
+    setInteractionSecret("acct", "test-bot-token");
   });
 
   it("generates a hex token", () => {
-    const token = generateInteractionToken({ action_id: "click" });
+    const token = generateInteractionToken({ action_id: "click" }, "acct");
     expect(token).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("verifies a valid token", () => {
     const context = { action_id: "do_now", item_id: "123" };
-    const token = generateInteractionToken(context);
-    expect(verifyInteractionToken(context, token)).toBe(true);
+    const token = generateInteractionToken(context, "acct");
+    expect(verifyInteractionToken(context, token, "acct")).toBe(true);
   });
 
   it("rejects a tampered token", () => {
     const context = { action_id: "do_now" };
-    const token = generateInteractionToken(context);
+    const token = generateInteractionToken(context, "acct");
     const tampered = token.replace(/.$/, token.endsWith("0") ? "1" : "0");
-    expect(verifyInteractionToken(context, tampered)).toBe(false);
+    expect(verifyInteractionToken(context, tampered, "acct")).toBe(false);
   });
 
   it("rejects a token generated with different context", () => {
-    const token = generateInteractionToken({ action_id: "a" });
-    expect(verifyInteractionToken({ action_id: "b" }, token)).toBe(false);
+    const token = generateInteractionToken({ action_id: "a" }, "acct");
+    expect(verifyInteractionToken({ action_id: "b" }, token, "acct")).toBe(false);
   });
 
   it("rejects tokens with wrong length", () => {
     const context = { action_id: "test" };
-    expect(verifyInteractionToken(context, "short")).toBe(false);
+    expect(verifyInteractionToken(context, "short", "acct")).toBe(false);
   });
 
   it("is deterministic for the same context", () => {
     const context = { action_id: "test", x: 1 };
-    const t1 = generateInteractionToken(context);
-    const t2 = generateInteractionToken(context);
+    const t1 = generateInteractionToken(context, "acct");
+    const t2 = generateInteractionToken(context, "acct");
     expect(t1).toBe(t2);
   });
 
@@ -120,22 +129,19 @@ describe("generateInteractionToken / verifyInteractionToken", () => {
     const contextA = { action_id: "do_now", tweet_id: "123", action: "do" };
     const contextB = { action: "do", action_id: "do_now", tweet_id: "123" };
     const contextC = { tweet_id: "123", action: "do", action_id: "do_now" };
-    const tokenA = generateInteractionToken(contextA);
-    const tokenB = generateInteractionToken(contextB);
-    const tokenC = generateInteractionToken(contextC);
+    const tokenA = generateInteractionToken(contextA, "acct");
+    const tokenB = generateInteractionToken(contextB, "acct");
+    const tokenC = generateInteractionToken(contextC, "acct");
     expect(tokenA).toBe(tokenB);
     expect(tokenB).toBe(tokenC);
   });
 
   it("verifies a token when Mattermost reorders context keys", () => {
-    // Simulate: token generated with keys in one order, verified with keys in another
-    // (Mattermost reorders context keys when storing/returning interactive message payloads)
     const originalContext = { action_id: "bm_do", tweet_id: "999", action: "do" };
-    const token = generateInteractionToken(originalContext);
+    const token = generateInteractionToken(originalContext, "acct");
 
-    // Mattermost returns keys in alphabetical order (or any arbitrary order)
     const reorderedContext = { action: "do", action_id: "bm_do", tweet_id: "999" };
-    expect(verifyInteractionToken(reorderedContext, token)).toBe(true);
+    expect(verifyInteractionToken(reorderedContext, token, "acct")).toBe(true);
   });
 
   it("verifies nested context regardless of nested key order", () => {
@@ -149,7 +155,7 @@ describe("generateInteractionToken / verifyInteractionToken", () => {
         },
       },
     };
-    const token = generateInteractionToken(originalContext);
+    const token = generateInteractionToken(originalContext, "acct");
 
     const reorderedContext = {
       payload: {
@@ -162,7 +168,7 @@ describe("generateInteractionToken / verifyInteractionToken", () => {
       action_id: "nested",
     };
 
-    expect(verifyInteractionToken(reorderedContext, token)).toBe(true);
+    expect(verifyInteractionToken(reorderedContext, token, "acct")).toBe(true);
   });
 
   it("rejects nested context tampering", () => {
@@ -173,7 +179,7 @@ describe("generateInteractionToken / verifyInteractionToken", () => {
         model: "gpt-5",
       },
     };
-    const token = generateInteractionToken(originalContext);
+    const token = generateInteractionToken(originalContext, "acct");
     const tamperedContext = {
       action_id: "nested",
       payload: {
@@ -182,7 +188,7 @@ describe("generateInteractionToken / verifyInteractionToken", () => {
       },
     };
 
-    expect(verifyInteractionToken(tamperedContext, token)).toBe(false);
+    expect(verifyInteractionToken(tamperedContext, token, "acct")).toBe(false);
   });
 
   it("scopes tokens per account when account secrets differ", () => {
@@ -323,12 +329,13 @@ describe("resolveInteractionCallbackPath", () => {
 
 describe("buildButtonAttachments", () => {
   beforeEach(() => {
-    setInteractionSecret("test-bot-token");
+    setInteractionSecret("acct", "test-bot-token");
   });
 
   it("returns an array with one attachment containing all buttons", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost:18789/mattermost/interactions/default",
+      accountId: "acct",
       buttons: [
         { id: "btn1", name: "Click Me" },
         { id: "btn2", name: "Skip", style: "danger" },
@@ -342,6 +349,7 @@ describe("buildButtonAttachments", () => {
   it("sets type to 'button' on every action", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost:18789/cb",
+      accountId: "acct",
       buttons: [{ id: "a", name: "A" }],
     });
 
@@ -351,6 +359,7 @@ describe("buildButtonAttachments", () => {
   it("includes HMAC _token in integration context", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost:18789/cb",
+      accountId: "acct",
       buttons: [{ id: "test", name: "Test" }],
     });
 
@@ -361,11 +370,11 @@ describe("buildButtonAttachments", () => {
   it("includes sanitized action_id in integration context", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost:18789/cb",
+      accountId: "acct",
       buttons: [{ id: "my_action", name: "Do It" }],
     });
 
     const action = requireAction(result);
-    // sanitizeActionId strips hyphens and underscores (Mattermost routing bug #25747)
     expect(action.integration.context.action_id).toBe("myaction");
     expect(action.id).toBe("myaction");
   });
@@ -373,6 +382,7 @@ describe("buildButtonAttachments", () => {
   it("merges custom context into integration context", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost:18789/cb",
+      accountId: "acct",
       buttons: [{ id: "btn", name: "Go", context: { tweet_id: "123", batch: true } }],
     });
 
@@ -387,6 +397,7 @@ describe("buildButtonAttachments", () => {
     const url = "http://localhost:18789/mattermost/interactions/default";
     const result = buildButtonAttachments({
       callbackUrl: url,
+      accountId: "acct",
       buttons: [
         { id: "a", name: "A" },
         { id: "b", name: "B" },
@@ -401,6 +412,7 @@ describe("buildButtonAttachments", () => {
   it("preserves button style", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost/cb",
+      accountId: "acct",
       buttons: [
         { id: "ok", name: "OK", style: "primary" },
         { id: "no", name: "No", style: "danger" },
@@ -414,6 +426,7 @@ describe("buildButtonAttachments", () => {
   it("uses provided text for the attachment", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost/cb",
+      accountId: "acct",
       buttons: [{ id: "x", name: "X" }],
       text: "Choose an action:",
     });
@@ -424,6 +437,7 @@ describe("buildButtonAttachments", () => {
   it("defaults to empty string text when not provided", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost/cb",
+      accountId: "acct",
       buttons: [{ id: "x", name: "X" }],
     });
 
@@ -433,32 +447,32 @@ describe("buildButtonAttachments", () => {
   it("generates verifiable tokens", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost/cb",
+      accountId: "acct",
       buttons: [{ id: "verify_me", name: "V", context: { extra: "data" } }],
     });
 
     const ctx = requireAction(result).integration.context;
     const token = ctx._token as string;
     const { _token, ...contextWithoutToken } = ctx;
-    expect(verifyInteractionToken(contextWithoutToken, token)).toBe(true);
+    expect(verifyInteractionToken(contextWithoutToken, token, "acct")).toBe(true);
   });
 
   it("generates tokens that verify even when Mattermost reorders context keys", () => {
     const result = buildButtonAttachments({
       callbackUrl: "http://localhost/cb",
+      accountId: "acct",
       buttons: [{ id: "do_action", name: "Do", context: { tweet_id: "42", category: "ai" } }],
     });
 
     const ctx = requireAction(result).integration.context;
     const token = ctx._token as string;
 
-    // Simulate Mattermost returning context with keys in a different order
     const reordered: Record<string, unknown> = {};
     const keys = Object.keys(ctx).filter((k) => k !== "_token");
-    // Reverse the key order to simulate reordering
     for (const key of keys.toReversed()) {
       reordered[key] = ctx[key];
     }
-    expect(verifyInteractionToken(reordered, token)).toBe(true);
+    expect(verifyInteractionToken(reordered, token, "acct")).toBe(true);
   });
 });
 
@@ -659,6 +673,7 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async () => ({ message: "unused" })),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
     });
   }
 
@@ -681,7 +696,7 @@ describe("createMattermostInteractionHandler", () => {
       }),
       botUserId: "bot",
       accountId: "acct",
-      allowedSourceIps: params?.allowedSourceIps,
+      allowedSourceIps: params?.allowedSourceIps ?? [params?.remoteAddress ?? "203.0.113.10"],
       trustedProxies: params?.trustedProxies,
     });
 
@@ -701,6 +716,7 @@ describe("createMattermostInteractionHandler", () => {
       ),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
     });
 
     return await runHandler(handler, {
@@ -777,6 +793,7 @@ describe("createMattermostInteractionHandler", () => {
       client: createMattermostClientMock(async () => createActionPost({ channelId: "chan-9" })),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
     });
 
     const res = await runHandler(handler, {
@@ -810,6 +827,7 @@ describe("createMattermostInteractionHandler", () => {
       ),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
       authorizeButtonClick: async () => ({
         ok: false,
         response: {
@@ -843,6 +861,7 @@ describe("createMattermostInteractionHandler", () => {
       ),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
       resolveSessionKey,
       dispatchButtonClick,
     });
@@ -853,9 +872,10 @@ describe("createMattermostInteractionHandler", () => {
     expect(res.statusCode).toBe(200);
     expect(resolveSessionKey).toHaveBeenCalledWith({
       channelId: "chan-1",
-      userId: "user-1",
       post: fetchedPost,
     });
+    const sessionKeyArgs = resolveSessionKey.mock.calls[0]?.[0] ?? {};
+    expect(sessionKeyArgs).not.toHaveProperty("userId");
     expect(enqueueSystemEvent).toHaveBeenCalledWith(
       expect.stringContaining('Mattermost button click: action="approve"'),
       expect.objectContaining({ sessionKey: "session:thread:root-9" }),
@@ -863,11 +883,13 @@ describe("createMattermostInteractionHandler", () => {
     expect(dispatchButtonClick).toHaveBeenCalledWith(
       expect.objectContaining({
         channelId: "chan-1",
-        userId: "user-1",
+        claimedUserName: "alice",
         postId: "post-1",
         post: fetchedPost,
       }),
     );
+    const dispatchArgs = dispatchButtonClick.mock.calls[0]?.[0] ?? {};
+    expect(dispatchArgs).not.toHaveProperty("userId");
   });
 
   it("lets a custom interaction handler short-circuit generic completion updates", async () => {
@@ -887,6 +909,7 @@ describe("createMattermostInteractionHandler", () => {
       }),
       botUserId: "bot",
       accountId: "acct",
+      allowedSourceIps: ["203.0.113.10"],
       handleInteraction,
       dispatchButtonClick,
     });
