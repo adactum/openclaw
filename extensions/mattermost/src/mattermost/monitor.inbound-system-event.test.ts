@@ -490,7 +490,26 @@ describe("mattermost button click HTTP handler — prompt-taint and malformed-pi
       baseUrl: "https://mattermost.example.com",
       apiBaseUrl: "https://mattermost.example.com/api/v4",
       token: "bot-token",
-      request: vi.fn(),
+      request: vi.fn(async (_path: string, init?: { method?: string }) => {
+        if (init?.method === "PUT") {
+          return { id: "post-1" };
+        }
+        return {
+          id: "post-1",
+          channel_id: "chan-1",
+          message: "Choose",
+          props: {
+            attachments: [
+              {
+                actions: [
+                  { id: "approve", name: "Approve" },
+                  { id: "mdlsel", name: "Select model" },
+                ],
+              },
+            ],
+          },
+        };
+      }),
       fetchImpl: vi.fn(),
     });
     mockState.createMattermostDraftStream.mockReturnValue({
@@ -733,6 +752,25 @@ describe("mattermost button click HTTP handler — prompt-taint and malformed-pi
       display_name: "",
       team_id: "team-1",
       type: "D",
+    });
+    mockState.createMattermostClient.mockReturnValue({
+      baseUrl: "https://mattermost.example.com",
+      apiBaseUrl: "https://mattermost.example.com/api/v4",
+      token: "bot-token",
+      request: vi.fn(async (_path: string, init?: { method?: string }) => {
+        if (init?.method === "PUT") {
+          return { id: "post-1" };
+        }
+        return {
+          id: "post-1",
+          channel_id: "dm-1",
+          message: "Choose",
+          props: {
+            attachments: [{ actions: [{ id: "approve", name: "Approve" }] }],
+          },
+        };
+      }),
+      fetchImpl: vi.fn(),
     });
     const interactions = await import("./interactions.js");
     const { generateInteractionToken } = interactions;

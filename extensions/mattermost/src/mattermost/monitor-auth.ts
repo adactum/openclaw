@@ -348,8 +348,16 @@ export function resolveButtonClickChannelAuthorization(params: {
 }): ButtonClickChannelAuthResult {
   const { channelInfo, account, groupPolicy, context } = params;
   const isPickerContext = parseMattermostModelPickerContext(context) !== null;
+  const isTaggedAsPicker = context?.oc_model_picker === true;
 
   if (!channelInfo) {
+    return { ok: false, ephemeralText: "OpenClaw ignored this action." };
+  }
+
+  // Tagged as a picker context but the full parser rejected it (missing ownerUserId,
+  // invalid action, etc.). Deny on ALL channel types before channel-specific logic —
+  // allowing these through the generic path would produce false agent-progress signal.
+  if (isTaggedAsPicker && !isPickerContext) {
     return { ok: false, ephemeralText: "OpenClaw ignored this action." };
   }
 

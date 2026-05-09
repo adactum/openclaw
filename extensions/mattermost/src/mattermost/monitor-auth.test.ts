@@ -364,9 +364,20 @@ describe("resolveButtonClickChannelAuthorization", () => {
       context: malformed,
     });
     expect(result).toMatchObject({ ok: false });
-    if (!result.ok) {
-      expect(result.ephemeralText).toMatch(/direct message/i);
-    }
+  });
+
+  it("denies a malformed picker context on a public channel (tag set, ownerUserId missing)", () => {
+    // A context tagged oc_model_picker:true that does not parse as valid picker state
+    // must be denied on ALL channel types — including group/public — before reaching
+    // the generic allow path. This prevents false agent-progress signal.
+    const malformed = { action_id: "approve", oc_model_picker: true } as Record<string, unknown>;
+    const result = resolveButtonClickChannelAuthorization({
+      channelInfo,
+      account: { ...baseAccount, config: { allowFrom: ["trusted-user"] } } as never,
+      groupPolicy: "allowlist",
+      context: malformed,
+    });
+    expect(result).toMatchObject({ ok: false });
   });
 
   it("allows a valid picker DM (parseable picker state with ownerUserId + valid action)", () => {
